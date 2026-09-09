@@ -1,0 +1,112 @@
+{
+  "name": "dp104status",
+  "version": "0.1.0",
+  "description": "Show Codex task status on a Ticktype DP104's dot-matrix screen. Records only structured lifecycle fields (event name, session id, agent id) \u2014 never prompts, conversation text or tool output.",
+  "author": {
+    "name": "skyler"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ticktype",
+    "dp104",
+    "keyboard",
+    "status-light"
+  ],
+  "hooks": {
+    "hooks": {
+      "SessionStart": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "PostToolUse": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "PermissionRequest": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "SubagentStart": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "SubagentStop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ],
+      "SessionEnd": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
+              "timeout": 5
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "interface": {
+    "displayName": "DP104 Status",
+    "shortDescription": "Codex activity on your DP104 screen",
+    "category": "Productivity"
+  }
+}

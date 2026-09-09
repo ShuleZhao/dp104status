@@ -1,0 +1,5 @@
+# 编译产物（只锚定仓库根，否则会连 codex/plugins/dp104status/ 一起忽略）
+/dp104status
+*.o
+*.dSYM/
+*.tmp

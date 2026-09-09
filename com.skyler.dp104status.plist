@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.skyler.dp104status</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/skyler/Agent/dp104status/dp104status</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- The daemon tolerates a missing keyboard, so restart it if it ever dies. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/skyler/.dp104status/daemon.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/skyler/.dp104status/daemon.err</string>
+</dict>
+</plist>

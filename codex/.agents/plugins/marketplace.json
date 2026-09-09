@@ -1,0 +1,20 @@
+{
+  "name": "dp104status",
+  "interface": {
+    "displayName": "DP104 Status"
+  },
+  "plugins": [
+    {
+      "name": "dp104status",
+      "source": {
+        "source": "local",
+        "path": "./plugins/dp104status"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
