@@ -70,7 +70,7 @@ let DONE_TTL: TimeInterval = 30    // how long DONE stays on screen before going
 let POLL_INTERVAL: TimeInterval = 0.4
 let RECONNECT_INTERVAL: TimeInterval = 3.0   // how often to look for a keyboard that went away
 let VERIFY_INTERVAL: TimeInterval = 5.0      // how often to read the screen back and re-assert
-let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // back off hard: churning the CDC port wedges it
+let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // how long to sit in the text fallback before retrying pixel
 let IDLE_FRAME = "(idle)"                    // cache marker for the dim resting frame
 
 // MARK: - Paths
@@ -587,9 +587,9 @@ final class Renderer {
     private var activeDisplay: Display { pixelDisabled ? .text : config.display }
     private var activeMode: UInt8 { activeDisplay == .pixel ? MODE_CUSTOM : MODE_SCROLL }
 
-    /// Resolved once and normally held for the daemon's lifetime. A stale file
-    /// descriptor gets one controlled reopen; repeated failures then back off
-    /// instead of churning the keyboard's CDC endpoint dozens of times a minute.
+    /// Resolved once and held for the daemon's lifetime; only a physical
+    /// disconnect drops it. Reconnect attempts are rate limited so a keyboard
+    /// that is simply absent does not get probed on every tick.
     private func serialPort() -> SerialPort? {
         if let serial { return serial }
         guard Date().timeIntervalSince(lastSerialAttempt) > SERIAL_RETRY_INTERVAL else { return nil }
@@ -600,25 +600,32 @@ final class Renderer {
         return port
     }
 
-    /// Try the held CDC connection, then one fresh connection. The second try
-    /// recovers the common case where the device node still exists but the old
-    /// descriptor stopped answering after a screen-mode transition.
+    /// Send on the held connection and keep that connection whatever happens.
+    ///
+    /// This keyboard's CDC endpoint sometimes stops answering entirely — every
+    /// command, down to a bare firmware query, reads back nothing, and only a
+    /// physical replug revives it. HID is unaffected throughout. It has been
+    /// seen twice and the trigger is not known: transport load, interleaved HID
+    /// reads and writes, open/close cycling, idle gaps up to 20s and truncated
+    /// transfers were each tested against it and none reproduced it. See
+    /// DP104-PROTOCOL.md §5.1 for the experiments.
+    ///
+    /// So holding one descriptor is caution, not a proven remedy, and there is
+    /// no reopen-as-recovery here: a failed frame is just a failed frame, and
+    /// the caller degrades to the text display rather than churning the port on
+    /// a hunch. Recovery lives in retryPixelIfDue().
     private func sendPixelFrame(_ payload: [UInt8]) -> Bool {
-        if let port = serialPort(),
-           port.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS) { return true }
-
-        serial = nil
-        lastSerialAttempt = Date.distantPast
-        guard let fresh = serialPort() else { return false }
-        return fresh.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS)
+        guard let port = serialPort() else { return false }
+        return port.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS)
     }
 
     private func serialFailed() {
         pixelDisabled = true
-        serial = nil
-        lastSerialAttempt = Date()
-        print("[\(stamp())] pixel display unreachable after controlled reopen "
-              + "— falling back to text; retrying in \(Int(SERIAL_RETRY_INTERVAL))s.")
+        lastSerialAttempt = Date()      // note: the port stays open on purpose
+        print("[\(stamp())] pixel frame failed — falling back to text; "
+              + "retrying in \(Int(SERIAL_RETRY_INTERVAL))s. "
+              + "If it never recovers, replug the keyboard: the CDC endpoint "
+              + "sometimes stops answering until it is physically reconnected.")
     }
 
     private func retryPixelIfDue() {
@@ -668,11 +675,6 @@ final class Renderer {
         }
         if text.isEmpty {
             guard rendered != nil else { return }
-            // Do not carry a CDC descriptor across the HID mode transition
-            // back to the user's idle screen. Some firmware revisions leave
-            // that descriptor open but stop answering it on the next frame.
-            serial = nil
-            if !pixelDisabled { lastSerialAttempt = Date.distantPast }
             restore(kb, baseline, idleMode: config.idleMode)
             rendered = nil
             print("[\(stamp())] idle — keyboard restored")
