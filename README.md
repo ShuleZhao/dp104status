@@ -86,19 +86,22 @@ Claude Code —— 把输出合并进 `~/.claude/settings.json`：
 ./dp104status hooks claude
 ```
 
-Codex —— 桌面版没有 CLI，用本地 marketplace 注册 `codex/` 下的插件，
-在 `~/.codex/config.toml` 里加两节：
+Codex —— 用桌面版内置的 CLI 注册本地 marketplace 并安装插件：
 
-```toml
-[marketplaces.dp104status]
-source_type = "local"
-source = "/Users/skyler/Agent/dp104status/codex"
-
-[plugins."dp104status@dp104status"]
-enabled = true
+```bash
+codex plugin marketplace add /absolute/path/to/dp104status/codex
+codex plugin add dp104status@dp104status
 ```
 
-改完要重启 Codex 才会加载。
+然后在这个仓库里启动一次 `codex --no-alt-screen`：
+
+1. 如果出现目录信任提示，选 `Yes, continue`。
+2. 出现 `Hooks need review` 后先检查命令，再选 `Trust all and continue`。
+3. 回到桌面版新建一个任务验证；已经打开的任务可能仍使用旧的 hook 快照。
+
+Codex 会按 hook 内容保存信任哈希。以后修改插件 hook 时需要重新安装并审批；
+不要手动复制 `hooks.state` 中的哈希。更详细的排查和验证见
+`CODEX-INTEGRATION.md`。
 
 ### 开机自启
 
@@ -143,6 +146,12 @@ DP104 点阵屏  (VIA CUSTOM_MENU_SET_VALUE)
 
 owner 键是 `{product}:{session_id}:{agent_id}`，子代理独立跟踪，
 `Stop` 会连带清掉同会话的子 owner——避免子代理结束时整块屏幕闪一下 DONE。
+Claude 与 Codex 的并发 hook 通过独立的 `state.lock` 串行更新，避免原子替换
+`state.json` 时丢掉另一边的 owner。
+
+像素串口失效时，daemon 会受控重开一次；仍失败则临时退回滚动文本，之后每 30 秒
+重试像素显示。进入 idle 前会关闭当前串口，避免把跨屏幕模式的陈旧连接带到下一轮；
+检测到键盘断开并重新连接后，也会立即清除降级状态。
 
 协议细节见 `DP104-PROTOCOL.md`。
 

@@ -53,13 +53,13 @@ let POLL_INTERVAL: TimeInterval = 0.4
 let RECONNECT_INTERVAL: TimeInterval = 3.0   // how often to look for a keyboard that went away
 let VERIFY_INTERVAL: TimeInterval = 5.0      // how often to read the screen back and re-assert
 let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // back off hard: churning the CDC port wedges it
-let SERIAL_MAX_FAILURES = 3                  // then fall back to the text display
 
 // MARK: - Paths
 
 let home = FileManager.default.homeDirectoryForCurrentUser
 let stateDir = home.appendingPathComponent(".dp104status")
 let stateURL = stateDir.appendingPathComponent("state.json")
+let stateLockURL = stateDir.appendingPathComponent("state.lock")
 let baselineURL = stateDir.appendingPathComponent("baseline.json")
 let configURL = stateDir.appendingPathComponent("config.json")
 
@@ -157,15 +157,18 @@ func render(_ agg: [String: Activity]) -> String {
 
 func withState<T>(_ body: (inout State) throws -> T) throws -> T {
     try ensureStateDir()
-    let path = stateURL.path
-    if !FileManager.default.fileExists(atPath: path) {
-        FileManager.default.createFile(atPath: path, contents: Data("{\"owners\":{}}".utf8))
-    }
-    let fd = open(path, O_RDWR)
+    // Lock a stable inode, not state.json itself. state.json is atomically
+    // replaced after every update, so a flock held on that file would protect
+    // only the old inode and concurrent Claude/Codex hooks could lose updates.
+    let fd = open(stateLockURL.path, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
     guard fd >= 0 else { throw NSError(domain: "dp104", code: 1,
                                        userInfo: [NSLocalizedDescriptionKey: "cannot open state"]) }
+    guard flock(fd, LOCK_EX) == 0 else {
+        close(fd)
+        throw NSError(domain: "dp104", code: 2,
+                      userInfo: [NSLocalizedDescriptionKey: "cannot lock state"])
+    }
     defer { flock(fd, LOCK_UN); close(fd) }
-    flock(fd, LOCK_EX)
 
     var state = (try? Data(contentsOf: stateURL)).flatMap { try? JSONDecoder().decode(State.self, from: $0) } ?? State()
     let result = try body(&state)
@@ -525,7 +528,6 @@ final class Renderer {
     private var lastAttempt = Date.distantPast
     private var lastVerify = Date.distantPast
     private var serial: SerialPort?
-    private var serialFailures = 0
     private var lastSerialAttempt = Date.distantPast
     private var pixelDisabled = false
     private let config = Config.load()
@@ -559,10 +561,9 @@ final class Renderer {
     private var activeDisplay: Display { pixelDisabled ? .text : config.display }
     private var activeMode: UInt8 { activeDisplay == .pixel ? MODE_CUSTOM : MODE_SCROLL }
 
-    /// Resolved once and held for the daemon's lifetime. Reopening per failure
-    /// is what wedges the keyboard's CDC endpoint — churning the port dozens of
-    /// times a minute leaves it answering nothing until it is physically
-    /// replugged — so failures back off instead of reconnecting immediately.
+    /// Resolved once and normally held for the daemon's lifetime. A stale file
+    /// descriptor gets one controlled reopen; repeated failures then back off
+    /// instead of churning the keyboard's CDC endpoint dozens of times a minute.
     private func serialPort() -> SerialPort? {
         if let serial { return serial }
         guard Date().timeIntervalSince(lastSerialAttempt) > SERIAL_RETRY_INTERVAL else { return nil }
@@ -573,14 +574,33 @@ final class Renderer {
         return port
     }
 
+    /// Try the held CDC connection, then one fresh connection. The second try
+    /// recovers the common case where the device node still exists but the old
+    /// descriptor stopped answering after a screen-mode transition.
+    private func sendPixelFrame(_ payload: [UInt8]) -> Bool {
+        if let port = serialPort(),
+           port.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS) { return true }
+
+        serial = nil
+        lastSerialAttempt = Date.distantPast
+        guard let fresh = serialPort() else { return false }
+        return fresh.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS)
+    }
+
     private func serialFailed() {
-        serialFailures += 1
-        if serialFailures >= SERIAL_MAX_FAILURES && !pixelDisabled {
-            pixelDisabled = true
-            serial = nil
-            print("[\(stamp())] pixel display unreachable after \(serialFailures) attempts "
-                  + "— falling back to text. Replug the keyboard to recover the serial link.")
-        }
+        pixelDisabled = true
+        serial = nil
+        lastSerialAttempt = Date()
+        print("[\(stamp())] pixel display unreachable after controlled reopen "
+              + "— falling back to text; retrying in \(Int(SERIAL_RETRY_INTERVAL))s.")
+    }
+
+    private func retryPixelIfDue() {
+        guard config.display == .pixel, pixelDisabled,
+              Date().timeIntervalSince(lastSerialAttempt) >= SERIAL_RETRY_INTERVAL else { return }
+        pixelDisabled = false
+        rendered = nil
+        print("[\(stamp())] retrying pixel display")
     }
 
     private func acquire() -> (Keyboard, Baseline)? {
@@ -589,6 +609,12 @@ final class Renderer {
             print("[\(stamp())] keyboard disconnected")
             kb = nil
             rendered = nil          // whatever it was showing is gone with it
+            // A physical reconnect gives the CDC endpoint a fresh lifetime.
+            // Drop the permanent text fallback and retry pixel transport from
+            // scratch once the HID side is available again.
+            serial = nil
+            lastSerialAttempt = Date.distantPast
+            pixelDisabled = false
         }
         guard Date().timeIntervalSince(lastAttempt) > RECONNECT_INTERVAL else { return nil }
         lastAttempt = Date()
@@ -603,10 +629,16 @@ final class Renderer {
     func update(_ agg: [String: Activity]) {
         guard let (kb, baseline) = acquire() else { return }
         verifyIfDue(kb)
+        retryPixelIfDue()
 
         let text = render(agg)
         if text.isEmpty {
             guard rendered != nil else { return }
+            // Do not carry a CDC descriptor across the HID mode transition
+            // back to the user's idle screen. Some firmware revisions leave
+            // that descriptor open but stop answering it on the next frame.
+            serial = nil
+            if !pixelDisabled { lastSerialAttempt = Date.distantPast }
             restore(kb, baseline, idleMode: config.idleMode)
             rendered = nil
             print("[\(stamp())] idle — keyboard restored")
@@ -629,11 +661,9 @@ final class Renderer {
             // Re-entering the mode would make the firmware reload its own stored
             // frame and discard ours, so never round-trip the mode here.
             if takingOver { kb.setScreenMode(MODE_CUSTOM) }
-            guard let port = serialPort() else { serialFailed(); rendered = nil; return }
-            guard port.sendFrame(buildFrame(agg), rows: SCREEN_ROWS, cols: SCREEN_COLS) else {
+            guard sendPixelFrame(buildFrame(agg)) else {
                 serialFailed(); rendered = nil; return
             }
-            serialFailures = 0
         }
 
         rendered = text
@@ -682,9 +712,10 @@ func printHooks(product: String) {
         .standardizedFileURL.path
     let events = product == "claude" ? claudeEvents : codexEvents
     let blocks = events.map { e in
-        """
+        let timeout = product == "codex" && e == "SessionEnd" ? 3 : 5
+        return """
             "\(e)": [
-              { "hooks": [{ "type": "command", "command": "\(exe) hook \(product)", "timeout": 5 }] }
+              { "hooks": [{ "type": "command", "command": "\(exe) hook \(product)", "timeout": \(timeout) }] }
             ]
         """
     }

@@ -1,6 +1,6 @@
 {
   "name": "dp104status",
-  "version": "0.1.0",
+  "version": "0.1.0+codex.20260909075059",
   "description": "Show Codex task status on a Ticktype DP104's dot-matrix screen. Records only structured lifecycle fields (event name, session id, agent id) \u2014 never prompts, conversation text or tool output.",
   "author": {
     "name": "skyler"
@@ -97,7 +97,7 @@
             {
               "type": "command",
               "command": "/Users/skyler/Agent/dp104status/dp104status hook codex",
-              "timeout": 5
+              "timeout": 3
             }
           ]
         }

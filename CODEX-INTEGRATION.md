@@ -1,88 +1,82 @@
-# 待解决：Codex hook 没有触发
+# 已解决：Codex hook 未触发
 
-Claude Code 一侧已经完全跑通。Codex 一侧插件能被加载，但生命周期事件从未到达
-`dp104status hook codex`，所以屏幕右半边（OpenAI 环）永远是熄的。
+## 结论
 
-## 现象
+根因是 **hook 已被加载，但还没有被用户信任**，不是插件注册、二进制路径或
+`command` handler 不受桌面版支持。
 
-Codex 正在跑任务时，`~/.dp104status/state.json` 里没有任何 `codex:` 开头的 owner。
+Codex 0.153.4 的 App Server `hooks/list` 对本插件返回了 8 个 hook，每个都是：
 
-## 已经排除的原因
+- `source: plugin`
+- `pluginId: dp104status@dp104status`
+- `handlerType: command`
+- `enabled: true`
+- `trustStatus: untrusted`
 
-| 检查项 | 结果 |
-| --- | --- |
-| 插件是否被加载 | ✅ 已materialize 到 `~/.codex/plugins/cache/dp104status/dp104status/0.1.0/`，八个事件都在 |
-| `config.toml` 写法 | ✅ 与官方插件的 `[plugins."name@marketplace"] enabled = true` 完全一致 |
-| 是否需要重启 | ✅ 插件缓存写于 14:38:54，Codex app-server 启动于 14:49:18，晚于它 |
-| hook 可执行文件 | ✅ 手动 `echo '{...}' \| dp104status hook codex` 正常写入状态并点亮屏幕 |
-| 二进制路径 | ✅ `plugin.json` 里是绝对路径，文件存在且可执行 |
+在 Codex CLI 的 `Hooks need review` 界面批准后，同一查询的 8 个结果全部变为
+`trustStatus: trusted`。
 
-也就是说：**链路两端都正常，缺的是 Codex 真正去调用它。**
+## 修复步骤
 
-## 当前实现
-
-marketplace 根目录在本仓库的 `codex/`：
-
-```
-codex/
-  .agents/plugins/marketplace.json
-  plugins/dp104status/
-    .codex-plugin/plugin.json      # hooks 内联在 "hooks" 键下
-    hooks/hooks.json               # 同样的 hooks，独立文件
-```
-
-两种写法同时存在，因为不确定这个 Codex 版本读哪一个。状态机对重复事件是幂等的，
-所以即使两边都生效也不会出错。
-
-注册方式（已写入 `~/.codex/config.toml`）：
-
-```toml
-[marketplaces.dp104status]
-source_type = "local"
-source = "<仓库路径>/codex"
-
-[plugins."dp104status@dp104status"]
-enabled = true
-```
-
-## 最可能的原因
-
-**Codex 需要用户显式批准 hook。** 参考项目 [Keyphore](https://github.com/BarryBarrywu/Keyphore)
-的 README 明确描述了这一步："Review and approve the Hooks. Setup presents the eight
-task-event definitions before enabling them"，并且批准后需要重新加载 Codex。
-它还有一条专门的 ADR 讲"不静默信任 Hook"。
-
-但在当前 Codex 桌面版里没有找到这个批准入口，`~/.codex/.codex-global-state.json`
-里也搜不到 `hookTrust` / `trustedHooks` / `hookConsent` 之类的键。
-
-## 次要疑点
-
-官方 bundled 插件（如 `browser`）的 hook 用的是 `"type": "mcp_tool"`，
-而本插件用的是 `"type": "command"`——后者是从 Keyphore 抄来的，那是给 **Codex CLI**
-用的写法。桌面版是否支持 `command` 类型的 plugin hook，没有直接证据。
-
-## 建议的排查方向
-
-1. 找出桌面版 Codex 的 hook 批准/信任入口，或确认它不存在
-2. 确认桌面版是否支持 `"type": "command"` 的 plugin hook；如果只支持 `mcp_tool`，
-   需要改成一个极小的 MCP server 来接收事件再转写状态文件
-3. 查 Codex 自己的日志（`~/.codex/logs_*.sqlite`，注意需要只读方式打开）
-   看有没有 hook 注册或拒绝的记录
-4. 兜底方案：放弃 hook，改为监听 `~/.codex/sessions` 的 rollout JSONL
-   （Microbridge 的做法）。不依赖 hook，但会耦合私有日志格式，随版本变化易碎，
-   因此只作为最后手段
-
-## 验证方法
+插件 marketplace 在本仓库的 `codex/` 目录。首次安装时：
 
 ```bash
 swiftc -O dp104status.swift -o dp104status
-./dp104status daemon &          # 或用 launchd
-# 在 Codex 里跑一个任务，然后：
-cat ~/.dp104status/state.json   # 应出现 codex:<session>:main
-./dp104status status            # 应显示 "CODEX WORK"
+codex plugin marketplace add /absolute/path/to/dp104status/codex
+codex plugin add dp104status@dp104status
 ```
 
-手动注入事件可以确认下游一切正常（这条现在就能通过）：
+然后在本仓库中启动 CLI：
+
+```bash
+codex --no-alt-screen
+```
+
+1. 如果 Codex 询问是否信任目录，选 `Yes, continue`。
+2. 在 `Hooks need review` 界面检查 8 条命令。
+3. 确认命令都是 `<repo>/dp104status hook codex` 后，选
+   `Trust all and continue`。
+4. 退出 CLI，在 Codex 桌面版新建一个任务。
+
+信任结果会以每条 hook 的内容哈希写入 `~/.codex/config.toml` 的
+`[hooks.state]`。不要手动填写或复制这些哈希；命令、超时或其他 hook 内容一旦改变，
+Codex 会把对应项标记为 `modified`，并要求重新审批。
+
+## 插件结构
+
+Codex 从 `.codex-plugin/plugin.json` 的顶层 `hooks` 字段加载这 8 个定义：
+
+```text
+codex/
+  .agents/plugins/marketplace.json
+  plugins/dp104status/
+    .codex-plugin/plugin.json
+```
+
+之前同时存在的 `hooks/hooks.json` 没有出现在 `hooks/list` 的 `sourcePath` 中，
+已删除，避免让人误以为两份定义都会生效。
+
+Codex 桌面版确实支持 `command` handler，不需要为此改成 MCP server，也不需要
+监听私有的 rollout JSONL。
+
+`SessionEnd` 在当前 Codex 中的超时上限是 3 秒。manifest 和
+`./dp104status hooks codex` 的输出都使用 3 秒，其他事件保持 5 秒。
+
+## 更新插件
+
+本地开发中修改 hook 后，需要刷新插件缓存、重装并重新审批变更的 hook。
+请使用 Codex 插件工具生成 cachebuster，然后：
+
+```bash
+codex plugin add dp104status@dp104status
+codex --no-alt-screen
+```
+
+已打开的任务可能保留启动时的 hook 快照，所以最后要用一个新任务验证。
+
+## 验证
+
+下游状态机可以先手动测试：
 
 ```bash
 echo '{"hook_event_name":"UserPromptSubmit","session_id":"t1","agent_id":"main"}' \
@@ -91,3 +85,15 @@ echo '{"hook_event_name":"UserPromptSubmit","session_id":"t1","agent_id":"main"}
 echo '{"hook_event_name":"SessionEnd","session_id":"t1","agent_id":"main"}' \
   | ./dp104status hook codex
 ```
+
+完整链路验证：
+
+```bash
+./dp104status daemon            # 也可以由 launchd 启动
+# 在 Codex 桌面版的新任务里发一条消息，然后在另一个终端查看：
+cat ~/.dp104status/state.json   # 运行期间应出现 codex:<session>:main
+./dp104status status            # 运行期间应显示 CODEX WORK
+```
+
+如果修改过 hook 后又不触发，先重新运行 `codex --no-alt-screen` 检查是否出现
+`Hooks need review`，不要先改成 MCP 或转去解析会话日志。
