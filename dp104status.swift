@@ -1,4 +1,22 @@
-// dp104status — show AI coding-agent activity on a Ticktype DP104's dot-matrix screen.
+// SPDX-License-Identifier: GPL-3.0-only
+//
+// dp104status — agent activity on a Ticktype DP104 keyboard screen
+// Copyright (C) 2026 Shule Zhao
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the
+// Free Software Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program. If not, see <https://www.gnu.org/licenses/>.
+//
+// The DP104 protocol was reverse-engineered rather than documented; see
+// NOTICE.md for where it came from and what it is derived from.
 //
 //   dp104status hook <claude|codex>   read one hook event from stdin, record it, exit
 //   dp104status daemon                own the keyboard and render the aggregate state
