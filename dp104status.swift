@@ -53,6 +53,7 @@ let POLL_INTERVAL: TimeInterval = 0.4
 let RECONNECT_INTERVAL: TimeInterval = 3.0   // how often to look for a keyboard that went away
 let VERIFY_INTERVAL: TimeInterval = 5.0      // how often to read the screen back and re-assert
 let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // back off hard: churning the CDC port wedges it
+let IDLE_FRAME = "(idle)"                    // cache marker for the dim resting frame
 
 // MARK: - Paths
 
@@ -82,6 +83,11 @@ struct Config: Codable {
     /// How to show an active state. Pixel needs the CDC serial interface;
     /// text needs only raw HID, and is the fallback if the port cannot be found.
     var display: Display = .pixel
+
+    /// Stay on the pixel display when nothing is running, with both halves dim,
+    /// instead of handing the screen back to the user's own mode. Keeps the
+    /// layout permanently visible so a state change is the only thing that moves.
+    var idleKeep: Bool = false
 
     static func load() -> Config {
         (try? Data(contentsOf: configURL)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
@@ -440,13 +446,15 @@ let glyphs: [String: [String]] = [
                "..###.."],
 ]
 
-/// RGB per state. Idle halves stay dark rather than dim: unlit means nothing running.
+/// RGB per state. An idle half is drawn dim rather than black so the layout
+/// stays readable — you can always see which side is which, and a state change
+/// reads as a colour change instead of something appearing out of nowhere.
 func color(for activity: Activity?) -> (Double, Double, Double) {
     switch activity {
     case .working: return (0, 0, 255)
     case .waiting: return (255, 132, 0)
     case .done:    return (0, 255, 0)
-    case nil:      return (0, 0, 0)
+    case nil:      return (36, 36, 36)
     }
 }
 
@@ -632,6 +640,14 @@ final class Renderer {
         retryPixelIfDue()
 
         let text = render(agg)
+        if text.isEmpty, config.idleKeep, activeDisplay == .pixel {
+            guard rendered != IDLE_FRAME else { return }
+            if rendered == nil { kb.setScreenMode(MODE_CUSTOM) }
+            guard sendPixelFrame(buildFrame([:])) else { serialFailed(); rendered = nil; return }
+            rendered = IDLE_FRAME
+            print("[\(stamp())] idle — holding the pixel display")
+            return
+        }
         if text.isEmpty {
             guard rendered != nil else { return }
             // Do not carry a CDC descriptor across the HID mode transition
@@ -787,8 +803,8 @@ case "preview":
     for row in 0..<SCREEN_ROWS {
         var line = "  "
         for col in 0..<SCREEN_COLS {
-            let i = (row * SCREEN_COLS + col) * 3
-            line += frame[i + 2] > 0 ? "#" : "."      // V channel: lit or not
+            let v = frame[(row * SCREEN_COLS + col) * 3 + 2]   // V channel
+            line += v == 0 ? "." : (v < 128 ? "-" : "#")       // off / dim / lit
         }
         print(line)
     }
@@ -800,12 +816,16 @@ case "config":
     let want = args.dropFirst(2).first
     switch (key, want) {
     case ("idle", .some(let v)):
-        if v == "restore" {
+        if v == "keep" {
+            cfg.idleKeep = true
+        } else if v == "restore" {
+            cfg.idleKeep = false
             cfg.idleMode = nil
         } else if let m = screenModes[v.lowercased()] {
+            cfg.idleKeep = false
             cfg.idleMode = m
         } else {
-            print("unknown mode \(v) — one of: \(screenModes.keys.sorted().joined(separator: ", ")), restore")
+            print("unknown mode \(v) — one of: \(screenModes.keys.sorted().joined(separator: ", ")), restore, keep")
             exit(2)
         }
     case ("display", .some(let v)):
@@ -814,7 +834,7 @@ case "config":
         }
         cfg.display = d
     case (.some(let k), _) where k != "idle" && k != "display":
-        print("usage: dp104status config [idle <mode>|display <pixel|text>]"); exit(2)
+        print("usage: dp104status config [idle <mode|restore|keep>|display <pixel|text>]"); exit(2)
     default:
         break
     }
@@ -822,7 +842,9 @@ case "config":
 
     let idleName = cfg.idleMode.flatMap { m in screenModes.first { $0.value == m }?.key }
     print("display  : \(cfg.display.rawValue)")
-    print("idle mode: \(idleName ?? "restore (whatever was there at startup)")")
+    print("idle mode: " + (cfg.idleKeep
+        ? "keep (stay on the pixel display, both halves dim)"
+        : (idleName ?? "restore (whatever was there at startup)")))
     print("config   : \(configURL.path)")
 
 default:

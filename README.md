@@ -72,11 +72,15 @@ pixel 需要 USB CDC 串口；串口连续失败 3 次会自动降级到 text，
 没有 agent 在跑时，屏幕停在哪个模式由 `~/.dp104status/config.json` 决定，默认 `info`：
 
 ```bash
+./dp104status config idle keep      # 留在图标界面，两半都画成暗灰
 ./dp104status config idle info      # off type custom info spark audio scroll
 ./dp104status config idle restore   # 还原成 daemon 启动时看到的模式
 ```
 
-文字槽无论如何都会还原成你自己的内容。
+`keep` 之外的选项都会把文字槽还原成你自己的内容。
+
+闲置的那一半画成暗灰而不是全黑，所以两个图标的轮廓始终可见，
+状态变化表现为颜色变化，而不是图形凭空出现。
 
 ### 安装 hooks
 
