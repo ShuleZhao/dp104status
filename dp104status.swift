@@ -72,6 +72,7 @@ let RECONNECT_INTERVAL: TimeInterval = 3.0   // how often to look for a keyboard
 let VERIFY_INTERVAL: TimeInterval = 5.0      // how often to read the screen back and re-assert
 let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // how long to sit in the text fallback before retrying pixel
 let IDLE_FRAME = "(idle)"                    // cache marker for the dim resting frame
+let EVENT_LOG_MAX_BYTES = 256 * 1024         // events.log is a debugging aid, not an archive
 
 // MARK: - Paths
 
@@ -254,12 +255,34 @@ func apply(event name: String, product: String, session: String, agent: String,
     }
 }
 
+/// Append one line per event so the real order of a product's lifecycle can be
+/// read back later. Only the structured identifiers are recorded — never prompt
+/// text, tool output or transcripts — and the file is truncated when it grows
+/// past the cap, so it cannot fill the disk.
+func logEvent(_ product: String, _ name: String, _ session: String, _ agent: String) {
+    let line = "\(stamp())  \(product)  \(name)  session=\(session.prefix(8)) agent=\(agent)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    let url = stateDir.appendingPathComponent("events.log")
+    if let size = try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int,
+       size > EVENT_LOG_MAX_BYTES {
+        try? FileManager.default.removeItem(at: url)
+    }
+    if let handle = try? FileHandle(forWritingTo: url) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+    } else {
+        try? data.write(to: url)
+    }
+}
+
 func runHook(product: String) {
     let input = FileHandle.standardInput.readDataToEndOfFile()
     guard let event = try? JSONDecoder().decode(HookEvent.self, from: input),
           let name = event.hook_event_name, !name.isEmpty else { exit(0) }
     let session = event.session_id.flatMap { $0.isEmpty ? nil : $0 } ?? "default"
     let agent = event.agent_id.flatMap { $0.isEmpty ? nil : $0 } ?? "main"
+    logEvent(product, name, session, agent)
     let now = Date().timeIntervalSince1970
     _ = try? withState { st in
         apply(event: name, product: product, session: session, agent: agent, to: &st, now: now)
