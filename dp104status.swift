@@ -82,6 +82,7 @@ let stateURL = stateDir.appendingPathComponent("state.json")
 let stateLockURL = stateDir.appendingPathComponent("state.lock")
 let baselineURL = stateDir.appendingPathComponent("baseline.json")
 let configURL = stateDir.appendingPathComponent("config.json")
+let serialLockURL = stateDir.appendingPathComponent("serial.lock")
 
 func ensureStateDir() throws {
     try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -107,6 +108,10 @@ struct Config: Codable {
     /// instead of handing the screen back to the user's own mode. Keeps the
     /// layout permanently visible so a state change is the only thing that moves.
     var idleKeep: Bool = false
+
+    /// Loopback port for remote sessions to report on, or nil to listen for
+    /// none. Off by default: opening a socket should be something you asked for.
+    var remotePort: UInt16? = nil
 
     static func load() -> Config {
         (try? Data(contentsOf: configURL)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
@@ -166,6 +171,7 @@ struct State: Codable {
     }
 }
 
+let products: Set<String> = ["claude", "codex"]
 let productNames = ["claude": "CLAUDE", "codex": "CODEX"]
 let productOrder = ["claude", "codex"]
 
@@ -276,10 +282,14 @@ func logEvent(_ product: String, _ name: String, _ session: String, _ agent: Str
     }
 }
 
-func runHook(product: String) {
-    let input = FileHandle.standardInput.readDataToEndOfFile()
-    guard let event = try? JSONDecoder().decode(HookEvent.self, from: input),
-          let name = event.hook_event_name, !name.isEmpty else { exit(0) }
+/// Record one event, wherever it came from: a local hook process or a remote
+/// session reporting over the loopback listener. Returns the event name so the
+/// caller can log it; nil when the payload is not a usable event.
+@discardableResult
+func ingest(product: String, payload: Data) -> String? {
+    guard products.contains(product),
+          let event = try? JSONDecoder().decode(HookEvent.self, from: payload),
+          let name = event.hook_event_name, !name.isEmpty else { return nil }
     let session = event.session_id.flatMap { $0.isEmpty ? nil : $0 } ?? "default"
     let agent = event.agent_id.flatMap { $0.isEmpty ? nil : $0 } ?? "main"
     logEvent(product, name, session, agent)
@@ -288,6 +298,11 @@ func runHook(product: String) {
         apply(event: name, product: product, session: session, agent: agent, to: &st, now: now)
         st.owners = st.owners.filter { $0.value.alive(now) }   // reap on the way past
     }
+    return name
+}
+
+func runHook(product: String) {
+    ingest(product: product, payload: FileHandle.standardInput.readDataToEndOfFile())
     exit(0)   // hooks must never block or fail the agent
 }
 
@@ -404,11 +419,24 @@ func findSerialPath() -> String? {
 
 final class SerialPort {
     private let fd: Int32
+    private let lockFd: Int32
     let path: String
 
+    /// macOS lets several processes hold the same /dev/cu.* at once, and they
+    /// then steal each other's replies — a documented hazard for this kind of
+    /// request/response protocol. Every time this keyboard's CDC endpoint has
+    /// died, a second process had the port open moments earlier; none of the
+    /// single-process stress tests ever killed it. That is a correlation rather
+    /// than a proven cause, but one writer is correct regardless, so the port is
+    /// guarded by an advisory lock and a second opener is refused outright.
     init?(path: String) {
+        lockFd = open(serialLockURL.path, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
+        guard lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
+            if lockFd >= 0 { close(lockFd) }
+            return nil
+        }
         let f = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
-        guard f >= 0 else { return nil }
+        guard f >= 0 else { flock(lockFd, LOCK_UN); close(lockFd); return nil }
         self.fd = f
         self.path = path
 
@@ -421,12 +449,14 @@ final class SerialPort {
             cc[Int(VMIN)] = 0
             cc[Int(VTIME)] = 10         // 1.0s read timeout
         }
-        guard tcsetattr(fd, TCSANOW, &t) == 0 else { close(f); return nil }
+        guard tcsetattr(fd, TCSANOW, &t) == 0 else {
+            close(f); flock(lockFd, LOCK_UN); close(lockFd); return nil
+        }
         _ = fcntl(fd, F_SETFL, 0)       // back to blocking reads
         tcflush(fd, TCIOFLUSH)
     }
 
-    deinit { close(fd) }
+    deinit { close(fd); flock(lockFd, LOCK_UN); close(lockFd) }
 
     /// One fixed-size 64-byte packet: [cmd, args..., zero padding].
     @discardableResult
@@ -566,6 +596,82 @@ func restore(_ kb: Keyboard, _ b: Baseline, idleMode: UInt8?) {
 // MARK: - Daemon
 
 func stamp() -> String { Date().formatted(date: .omitted, time: .standard) }
+
+// MARK: - Remote sessions
+
+/// Hooks run wherever the agent runs. A Claude Code or Codex session opened
+/// over SSH therefore executes its hooks on the remote host, which has neither
+/// this binary nor the keyboard, so those sessions are invisible to a purely
+/// local daemon. This listener accepts the same events over a socket so a
+/// remote session can report in through an SSH reverse tunnel.
+///
+/// It binds the loopback address only — never a routable one — so nothing can
+/// reach it except processes on this Mac and whatever `ssh -R` forwards into
+/// it. Payloads are length-capped and drive nothing but the aggregate state.
+final class RemoteListener {
+    private let fd: Int32
+    private let queue = DispatchQueue(label: "dp104.remote")
+    private var source: DispatchSourceRead?
+
+    static let maxPayload = 8 * 1024
+
+    init?(port: UInt16) {
+        fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = INADDR_LOOPBACK.bigEndian    // 127.0.0.1, nothing else
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(fd, 16) == 0 else { close(fd); return nil }
+
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        src.setEventHandler { [weak self] in self?.acceptOne() }
+        src.setCancelHandler { [fd] in close(fd) }
+        src.resume()
+        source = src
+    }
+
+    deinit { source?.cancel() }
+
+    private func acceptOne() {
+        let client = accept(fd, nil, nil)
+        guard client >= 0 else { return }
+        defer { close(client) }
+
+        // Don't let a stalled peer hold the accept loop.
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var buf = [UInt8]()
+        var chunk = [UInt8](repeating: 0, count: 1024)
+        while buf.count < Self.maxPayload {
+            let n = read(client, &chunk, chunk.count)
+            if n <= 0 { break }
+            buf += chunk[0..<n]
+            if buf.contains(0x0a) { break }                 // one line per connection
+        }
+        guard let newline = buf.firstIndex(of: 0x0a) ?? (buf.isEmpty ? nil : buf.count) else { return }
+        let line = Array(buf[0..<newline])
+
+        // "<product>\t<event json>"
+        guard let tab = line.firstIndex(of: 0x09) else { return }
+        let product = String(decoding: line[0..<tab], as: UTF8.self)
+        let json = Data(line[(tab + 1)...])
+        if let name = ingest(product: product, payload: json) {
+            print("[\(stamp())] remote \(product) \(name)")
+        }
+    }
+}
 
 /// Owns the keyboard for the daemon's lifetime, surviving unplug/replug.
 /// A missing keyboard is a normal state here, not a fatal one: hooks keep
@@ -743,6 +849,15 @@ func runDaemon() {
 
     let renderer = Renderer()
 
+    var remote: RemoteListener?
+    if let port = Config.load().remotePort {
+        remote = RemoteListener(port: port)
+        print(remote == nil
+              ? "remote: could not bind 127.0.0.1:\(port) — is another daemon running?"
+              : "remote: listening on 127.0.0.1:\(port)")
+    }
+    _ = remote     // held for the daemon's lifetime
+
     for sig in [SIGINT, SIGTERM] {
         signal(sig, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -819,7 +934,11 @@ case "hooks":
 case "pixel-test":
     guard let path = findSerialPath() else { print("no serial node for \(String(format: "%04x:%04x", VID, PID))"); exit(1) }
     print("serial node : \(path)")
-    guard let port = SerialPort(path: path) else { print("open failed: \(String(cString: strerror(errno)))"); exit(1) }
+    guard let port = SerialPort(path: path) else {
+        print("open failed — the daemon already holds the port. Stop it first:")
+        print("  launchctl bootout gui/$(id -u)/com.skyler.dp104status")
+        exit(1)
+    }
     print("opened      : ok")
     let hdr = port.packet(CMD_FRAME_HEADER, [1, 10, UInt8(SCREEN_ROWS), UInt8(SCREEN_COLS)])
     if let h = hdr {
@@ -876,8 +995,17 @@ case "config":
             print("unknown display \(v) — pixel or text"); exit(2)
         }
         cfg.display = d
-    case (.some(let k), _) where k != "idle" && k != "display":
-        print("usage: dp104status config [idle <mode|restore|keep>|display <pixel|text>]"); exit(2)
+    case ("remote", .some(let v)):
+        if v == "off" {
+            cfg.remotePort = nil
+        } else if let p = UInt16(v), p >= 1024 {
+            cfg.remotePort = p
+        } else {
+            print("remote takes a port above 1023, or off"); exit(2)
+        }
+    case (.some(let k), _) where !["idle", "display", "remote"].contains(k):
+        print("usage: dp104status config [idle <mode|restore|keep>"
+              + "|display <pixel|text>|remote <port|off>]"); exit(2)
     default:
         break
     }
@@ -888,7 +1016,31 @@ case "config":
     print("idle mode: " + (cfg.idleKeep
         ? "keep (stay on the pixel display, both halves dim)"
         : (idleName ?? "restore (whatever was there at startup)")))
+    print("remote   : " + (cfg.remotePort.map { "127.0.0.1:\($0)" } ?? "off"))
     print("config   : \(configURL.path)")
+
+case "remote-hook":
+    guard let p = args.dropFirst().first, products.contains(p) else {
+        print("usage: dp104status remote-hook <claude|codex>"); exit(2)
+    }
+    let port = Config.load().remotePort ?? 47104
+    // Bash's /dev/tcp keeps this dependency-free on the remote host, and every
+    // failure path exits 0: a missing tunnel must never fail the agent's turn.
+    print("""
+    #!/bin/bash
+    # dp104status remote hook — reports one \(p) lifecycle event to a Mac
+    # running `dp104status daemon`, reached through an SSH reverse tunnel.
+    #
+    # Install on the remote host, make it executable, and point that host's
+    # hook configuration at it. It sends only the event name and identifiers
+    # the daemon already reads; the prompt and tool output stay on this host.
+    exec 3<>/dev/tcp/127.0.0.1/\(port) 2>/dev/null || exit 0
+    printf '%s\\t' '\(p)' >&3
+    tr -d '\\r\\n' >&3
+    printf '\\n' >&3
+    exec 3>&-
+    exit 0
+    """)
 
 default:
     print("""

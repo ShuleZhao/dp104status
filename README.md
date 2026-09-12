@@ -107,6 +107,40 @@ Codex 会按 hook 内容保存信任哈希。以后修改插件 hook 时需要�
 不要手动复制 `hooks.state` 中的哈希。更详细的排查和验证见
 `CODEX-INTEGRATION.md`。
 
+### 远程（SSH）会话
+
+hook 在 **agent 运行的那台机器上**执行。通过 SSH 打开的 Claude Code 会话、
+或在远程服务器上跑的 Codex 任务，它们的 hook 在远端触发，那里既没有这个二进制
+也没有键盘——所以纯本地的 daemon 看不到它们。
+
+daemon 可以额外监听一个**仅回环**的端口，让远端通过 SSH 反向隧道把事件报回来：
+
+```bash
+./dp104status config remote 47104      # 开启；off 关闭
+```
+
+在 Mac 的 `~/.ssh/config` 里给那台服务器加一行反向转发，这样所有到它的 SSH
+连接都会自动带上隧道，包括桌面端自己发起的：
+
+```
+Host your-server
+    RemoteForward 47104 127.0.0.1:47104
+```
+
+在远端装上转发脚本，并把该机器的 hook 配置指向它：
+
+```bash
+# 在 Mac 上生成，内容拷到远端
+./dp104status remote-hook claude > remote-hook-claude.sh
+./dp104status remote-hook codex  > remote-hook-codex.sh
+```
+
+脚本用 bash 的 `/dev/tcp`，远端零依赖，且**所有失败路径都 exit 0**——
+隧道没通绝不会拖累 agent。它只发送 daemon 本来就读的那几个字段，
+prompt 和工具输出留在远端。
+
+监听只绑 `127.0.0.1`，不绑任何可路由地址；`ssh -R` 默认也只在远端回环监听。
+
 ### 开机自启
 
 ```bash
