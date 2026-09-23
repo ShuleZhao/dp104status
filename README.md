@@ -1,5 +1,7 @@
 # dp104status
 
+![dp104status — Claude Code 与 Codex 状态显示](assets/dp104status-xiaohongshu-poster.png)
+
 把 Claude Code 和 Codex 的工作状态显示在 Ticktype DP104 的点阵屏上。
 
 屏幕 8×24 分成左右两半，各归一个 agent，颜色表示状态：
