@@ -11,7 +11,7 @@
 ...#.#.#.......#...#....     右：OpenAI 环     = Codex
 ....###.......#.....#...
 ..#######.....#..#..#...     蓝 = 在跑   橙 = 等你批准
-....###.......#.....#...     绿 = 刚结束  灭 = 闲置
+....###.......#.....#...     绿 = 刚结束  暗灰 = 闲置
 ...#.#.#.......#...#....
 ..#..#..#.......###.....
 ........................
@@ -19,9 +19,10 @@
 
 `./dp104status preview working waiting` 可以在终端里预览，不用碰硬件。
 
-也可以切成单行滚动文字（`CLAUDE WORK  CODEX WAIT`），见下面的 display 配置。
+也可以用单行滚动文字（`CLAUDE WORK  CODEX WAIT`），见下面的显示方式。
 
-没有 agent 在跑的时候，键盘还原成你自己的设置——不占用屏幕。
+**它跟着你的屏幕模式走，不改你的设置**：屏幕放在 CUSTOM，它就是常驻的状态屏；
+放在 INFO 或别的模式，只在 agent 工作时借用，结束后原样还给你。
 
 ## 状态
 
@@ -49,40 +50,42 @@ swiftc -O dp104status.swift -o dp104status
 ## 用法
 
 ```bash
-./dp104status daemon                # 常驻，占用键盘并渲染状态
+./dp104status daemon                # 常驻，驱动屏幕
 ./dp104status hook <claude|codex>   # 从 stdin 读一个 hook 事件（由 agent 调用）
-./dp104status status                # 打印当前会渲染成什么
-./dp104status restore               # 把键盘还原成 baseline
+./dp104status status                # 当前会渲染成什么，屏幕是否被借用
+./dp104status probe                 # 只读查看键盘：屏幕模式、亮度、多久休眠
+./dp104status restore               # 手动归还被借用的屏幕
+./dp104status config display <d>    # mixed / pixel / text
 ./dp104status hooks <claude|codex>  # 打印要安装的 hook 配置
-./dp104status config idle <mode>    # 闲置时屏幕停在哪个模式
-./dp104status config display <d>    # pixel（图标分区）或 text（滚动文字）
 ./dp104status preview <a> <b>       # 终端预览图形，参数是两个 agent 的状态
-./dp104status pixel-test            # 诊断 CDC 串口链路
+./dp104status pixel-test            # 诊断像素链路（需先停 daemon）
 ```
+
+### 屏幕跟随你的模式
+
+没有"闲置时停在哪"的设置——由你自己用键盘上的切换键决定：
+
+| 你把屏幕放在 | agent 工作时 | agent 全部空闲后 |
+| --- | --- | --- |
+| **CUSTOM** | 原地画状态，不切模式 | 原地画暗灰仪表盘 |
+| **其他模式**（INFO 等） | 借用：切去显示状态 | 切回你原来的模式，文字原样恢复 |
+
+**借用期间你按了切换键，就是你把屏幕要回去了**：它立刻放手，直到 agent 全部
+空闲之前都不会再借。切**到** CUSTOM 则相反——那是在说"我要看状态屏"。
+
+借用开始时才记下你当时的模式和文字（不是 daemon 启动时），所以你中途改过的
+设置不会被旧值覆盖。借用记录在 `~/.dp104status/takeover.json`，daemon 意外退出后，
+下一次启动会先把屏幕还给你。
 
 ### 显示方式
 
 ```bash
-./dp104status config display pixel  # 默认，左右两个图标，走 CDC 串口
-./dp104status config display text   # 单行滚动文字，只用 HID
+./dp104status config display mixed  # 默认：像素链路通就画图标，不通就用滚动文字
+./dp104status config display pixel  # 只用图标；链路不通时不碰你的屏幕
+./dp104status config display text   # 只用滚动文字：只走 HID，最稳
 ```
 
-pixel 需要 USB CDC 串口；串口连续失败 3 次会自动降级到 text，日志里会说明。
-
-### 闲置模式
-
-没有 agent 在跑时，屏幕停在哪个模式由 `~/.dp104status/config.json` 决定，默认 `info`：
-
-```bash
-./dp104status config idle keep      # 留在图标界面，两半都画成暗灰
-./dp104status config idle info      # off type custom info spark audio scroll
-./dp104status config idle restore   # 还原成 daemon 启动时看到的模式
-```
-
-`keep` 之外的选项都会把文字槽还原成你自己的内容。
-
-闲置的那一半画成暗灰而不是全黑，所以两个图标的轮廓始终可见，
-状态变化表现为颜色变化，而不是图形凭空出现。
+改完需要重启 daemon（命令会提示怎么做）。
 
 ### 安装 hooks
 
@@ -169,29 +172,26 @@ DP104 点阵屏  (VIA CUSTOM_MENU_SET_VALUE)
 **hook 进程绝不打开键盘。** 它解析事件、更新状态文件、退出，而且无论如何都 `exit(0)`——
 键盘拔了、daemon 没开、状态文件锁不住，都不会让你的 agent 报错或变慢。
 
-**daemon 是唯一的 HID 持有者。** 它保存用户原有的文字和屏幕模式到
-`~/.dp104status/baseline.json`，接管时清空 slot 1–4 只留 slot 0 滚动，
-闲置和退出时还原。`SIGTERM` 也会触发还原。
+**daemon 是唯一的 HID 持有者。** 只在借用时改动屏幕，归还时把借用那一刻记下的
+模式和文字原样写回。写模式前先看当前值，已经是目标值就不写——重新进入 CUSTOM
+会让固件重载它存储的那一帧，同值写入也不是没有代价的。
 
 **不碰 flash。** 全程只发 VIA `CUSTOM_MENU_SET_VALUE` (0x07)，这是 RAM 写入、立即生效。
-`CUSTOM_MENU_SAVE` (0x09) 一次都不发，所以高频状态变化不会磨损 EEPROM。
+`CUSTOM_MENU_SAVE` (0x09) 一次都不发，所以高频状态变化不会磨损 EEPROM，
+拔插键盘也会让它回到你自己保存的设置。
 
-**热插拔。** 键盘消失时 daemon 继续运行并每 3 秒重试；插回来后强制重绘，
-状态不会因为拔插而丢失。
+**键盘休眠不是拔线。** DP104 默认 5 分钟没按键就休眠，这期间 HID 和像素链路都不应答。
+插拔只看 IOKit 的设备插拔回调；写入失败只当作"暂时没应答"，按 2→4→5 秒退避、
+期间不碰键盘，醒来后重绘一次、重开一次像素链路。
 
-**自愈。** daemon 缓存了"我以为屏幕在显示什么"以免每个 tick 都重写，但那个缓存
-会因为别人动了键盘而失同步——按 `TJM_MOD` 键、VIA 网页、或者手动跑 `restore`。
-所以它每 5 秒回读一次屏幕模式和 slot 0，跟缓存不符就重新写入，日志里会记一条
-`screen changed externally ... reasserting`。
+**先确认能画，再切 CUSTOM。** 借用前先探测像素链路，通了才切模式；切过去之后
+上传失败就立刻切回去——固件存储的那一帧永远不会留在屏幕上。像素链路不应答时按
+15 秒起、翻倍到 5 分钟的退避重试，不会对着一条死链路反复敲。
 
 owner 键是 `{product}:{session_id}:{agent_id}`，子代理独立跟踪，
 `Stop` 会连带清掉同会话的子 owner——避免子代理结束时整块屏幕闪一下 DONE。
 Claude 与 Codex 的并发 hook 通过独立的 `state.lock` 串行更新，避免原子替换
 `state.json` 时丢掉另一边的 owner。
-
-像素串口失效时，daemon 会受控重开一次；仍失败则临时退回滚动文本，之后每 30 秒
-重试像素显示。进入 idle 前会关闭当前串口，避免把跨屏幕模式的陈旧连接带到下一轮；
-检测到键盘断开并重新连接后，也会立即清除降级状态。
 
 协议细节见 `DP104-PROTOCOL.md`。
 
@@ -210,11 +210,28 @@ Claude 与 Codex 的并发 hook 通过独立的 `state.lock` 串行更新，避�
 状态不对时先看它：能直接看出某个 agent 到底发了哪些事件、按什么顺序，
 以及是不是压根没发。
 
+`daemon.log` 里的几种正常现象：
+
+| 日志 | 意思 |
+| --- | --- |
+| `keyboard not answering (asleep?)` / `keyboard awake` | 键盘休眠和醒来，正常 |
+| `you switched the screen to … — leaving it to you` | 你按了切换键，它放手了 |
+| `idle — screen handed back (INFO)` | 借用结束，屏幕还给你 |
+| `pixel link not answering — next try in …` | 像素链路暂时不通；mixed 下会先用文字 |
+
+### 端到端测试
+
+`tests/e2e.py` 在真键盘上跑一遍借用、归还、放手、常驻、崩溃恢复、文字模式，
+每条断言都读回模式寄存器和文字槽来判定，不靠目测。会让屏幕来回切换约两分钟，
+结束时回到 INFO 和你的文字。用法见文件开头。
+
 ## 已知限制
 
 - 只在 **USB 有线** 下验证过。2.4G / 蓝牙模式下 Raw HID 是否可用未测。
 - 屏幕文本是 ASCII，30 字符上限，会自动转大写。
 - daemon 用轮询（400ms）而不是文件监听，够用且简单。
+- 若固件里存储的 CUSTOM 帧不是仪表盘（比如早期测试留下的纯色帧），常驻模式下
+  键盘刚醒来的几秒内可能先露出它，随后被重绘覆盖。
 
 ## 授权
 

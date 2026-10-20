@@ -68,19 +68,26 @@ let CMD_FRAME_DATA: UInt8 = 0xC1
 let WORK_TTL: TimeInterval = 3600  // a stuck "working" owner is reaped after an hour
 let DONE_TTL: TimeInterval = 30    // how long DONE stays on screen before going idle
 let POLL_INTERVAL: TimeInterval = 0.4
-let RECONNECT_INTERVAL: TimeInterval = 3.0   // how often to look for a keyboard that went away
-let VERIFY_INTERVAL: TimeInterval = 5.0      // how often to read the screen back and re-assert
-let SERIAL_RETRY_INTERVAL: TimeInterval = 30 // how long to sit in the text fallback before retrying pixel
-let IDLE_FRAME = "(idle)"                    // cache marker for the dim resting frame
+let MODE_CHECK_INTERVAL: TimeInterval = 3.0   // how often to look at the mode — the user may have changed it
+let HID_REPLY_TIMEOUT: TimeInterval = 0.5     // how long one HID request waits for its reply
+let SLEEP_BACKOFF_MIN: TimeInterval = 2       // probing a keyboard that stopped answering:
+let SLEEP_BACKOFF_MAX: TimeInterval = 5       //   so a redraw follows within seconds of it waking
+let CDC_RETRY_MIN: TimeInterval = 15          // retrying a pixel link that stopped answering:
+let CDC_RETRY_MAX: TimeInterval = 300         //   doubling, so a dead link is not hammered
+let IDLE_KEY = "(idle)"                       // cache key for the dim dashboard frame
 let EVENT_LOG_MAX_BYTES = 256 * 1024         // events.log is a debugging aid, not an archive
 
 // MARK: - Paths
 
 let home = FileManager.default.homeDirectoryForCurrentUser
-let stateDir = home.appendingPathComponent(".dp104status")
+/// DP104STATUS_HOME points everything — state, config, logs, locks — somewhere
+/// else, e.g. to drive a test daemon without the live hooks writing into it.
+let stateDir = ProcessInfo.processInfo.environment["DP104STATUS_HOME"]
+    .map { URL(fileURLWithPath: $0, isDirectory: true) }
+    ?? home.appendingPathComponent(".dp104status")
 let stateURL = stateDir.appendingPathComponent("state.json")
 let stateLockURL = stateDir.appendingPathComponent("state.lock")
-let baselineURL = stateDir.appendingPathComponent("baseline.json")
+let takeoverURL = stateDir.appendingPathComponent("takeover.json")
 let configURL = stateDir.appendingPathComponent("config.json")
 let serialLockURL = stateDir.appendingPathComponent("serial.lock")
 
@@ -91,27 +98,31 @@ func ensureStateDir() throws {
 // MARK: - Config
 
 enum Display: String, Codable {
-    case pixel     // two 8x12 halves on the dot-matrix screen, one per product
-    case text      // a single scrolling line, "CLAUDE WORK  CODEX WAIT"
+    case mixed     // icons while the pixel link answers, scrolling text while it doesn't
+    case pixel     // icons only — with the pixel link down, the screen is left alone
+    case text      // scrolling text only: raw HID alone, the most robust
 }
 
+/// What the screen does is otherwise decided by the user's own screen mode, not
+/// by settings here — see Renderer.
 struct Config: Codable {
-    /// Screen mode to leave the keyboard in when nothing is running.
-    /// nil means "put back whatever mode was there when the daemon first started".
-    var idleMode: UInt8? = MODE_INFO
-
-    /// How to show an active state. Pixel needs the CDC serial interface;
-    /// text needs only raw HID, and is the fallback if the port cannot be found.
-    var display: Display = .pixel
-
-    /// Stay on the pixel display when nothing is running, with both halves dim,
-    /// instead of handing the screen back to the user's own mode. Keeps the
-    /// layout permanently visible so a state change is the only thing that moves.
-    var idleKeep: Bool = false
+    var display: Display = .mixed
 
     /// Loopback port for remote sessions to report on, or nil to listen for
     /// none. Off by default: opening a socket should be something you asked for.
     var remotePort: UInt16? = nil
+
+    private enum CodingKeys: String, CodingKey { case display, remotePort }
+
+    init() {}
+
+    /// Lenient: a missing or unrecognised key keeps its default rather than
+    /// discarding the whole file. Older configs carry keys this version dropped.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        display = (try? c.decodeIfPresent(Display.self, forKey: .display)) ?? .mixed
+        remotePort = (try? c.decodeIfPresent(UInt16.self, forKey: .remotePort)) ?? nil
+    }
 
     static func load() -> Config {
         (try? Data(contentsOf: configURL)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
@@ -308,87 +319,175 @@ func runHook(product: String) {
 
 // MARK: - HID transport
 
-final class Keyboard {
+/// The keyboard's raw-HID interface, followed for as long as the process lives.
+///
+/// Whether the keyboard is physically there comes from IOKit's matching and
+/// removal callbacks — never from a failed write. Writes fail whenever the
+/// keyboard is asleep (its own idle timer: five minutes by default), and taking
+/// that for an unplug is what used to drive the daemon round a reconnect loop
+/// every six seconds, re-entering CUSTOM on each lap and exposing whatever frame
+/// the firmware had stored.
+///
+/// IOKit's callbacks run on a private queue. The caller waits for a reply on a
+/// semaphore instead of spinning the main run loop, so the poll timer and the
+/// signal handler can never run re-entrantly in the middle of an exchange.
+final class HIDLink {
     private let manager: IOHIDManager
-    private let device: IOHIDDevice
-    private var buf = [UInt8](repeating: 0, count: 64)
-    private final class Box { var last: [UInt8]? }
-    private let box = Box()
+    private let queue = DispatchQueue(label: "dp104.hid")
+    private let lock = NSLock()
+    private let replied = DispatchSemaphore(value: 0)
+    private let cancelled = DispatchSemaphore(value: 0)
 
-    /// Set when a report cannot be delivered at all — the device is gone, as
-    /// opposed to a command the firmware simply does not implement.
-    private(set) var gone = false
+    private var _device: IOHIDDevice?
+    private var _generation = 0
+    private var awaiting: [UInt8]?
+    private var reply: [UInt8]?
 
-    deinit { IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone)) }
+    var device: IOHIDDevice? { lock.lock(); defer { lock.unlock() }; return _device }
 
-    init?() {
+    /// Bumped on every attach and detach. The callbacks only record the change;
+    /// the renderer notices it on its next tick instead of being called back in
+    /// the middle of its own work.
+    var generation: Int { lock.lock(); defer { lock.unlock() }; return _generation }
+
+    init() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerSetDeviceMatching(manager, [
             kIOHIDVendorIDKey: VID, kIOHIDProductIDKey: PID,
             kIOHIDPrimaryUsagePageKey: USAGE_PAGE, kIOHIDPrimaryUsageKey: USAGE,
         ] as CFDictionary)
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
-        guard IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess,
-              let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-              let dev = set.first else { return nil }
-        device = dev
-        IOHIDDeviceRegisterInputReportCallback(device, &buf, buf.count, { ctx, _, _, _, _, rep, len in
-            Unmanaged<Box>.fromOpaque(ctx!).takeUnretainedValue().last =
-                Array(UnsafeBufferPointer(start: rep, count: min(len, 64)))
-            CFRunLoopStop(CFRunLoopGetCurrent())
-        }, Unmanaged.passUnretained(box).toOpaque())
+        let me = Unmanaged.passUnretained(self).toOpaque()
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, dev in
+            Unmanaged<HIDLink>.fromOpaque(ctx!).takeUnretainedValue().attach(dev)
+        }, me)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, { ctx, _, _, dev in
+            Unmanaged<HIDLink>.fromOpaque(ctx!).takeUnretainedValue().detach(dev)
+        }, me)
+        // Registered on the manager, before activation: with a dispatch queue,
+        // IOKit traps if a callback is registered on a device after activation.
+        IOHIDManagerRegisterInputReportCallback(manager, { ctx, _, _, _, _, report, len in
+            Unmanaged<HIDLink>.fromOpaque(ctx!).takeUnretainedValue()
+                .received(Array(UnsafeBufferPointer(start: report, count: min(len, 64))))
+        }, me)
+        IOHIDManagerSetDispatchQueue(manager, queue)
+        IOHIDManagerSetCancelHandler(manager) { [cancelled] in cancelled.signal() }
+        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerActivate(manager)
+        // Look the keyboard up synchronously as well, so one-shot commands work
+        // without waiting for the matching callback to arrive.
+        if let found = (IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>)?.first { attach(found) }
     }
 
-    @discardableResult
-    func send(_ cmd: UInt8, _ args: [UInt8]) -> [UInt8]? {
+    /// A manager running on a dispatch queue may only be released once it has been
+    /// cancelled and its cancel handler has run; releasing it any sooner aborts.
+    deinit {
+        IOHIDManagerCancel(manager)
+        cancelled.wait()
+    }
+
+    private func attach(_ dev: IOHIDDevice) {
+        lock.lock()
+        if let current = _device, CFEqual(current, dev) { lock.unlock(); return }  // matching repeats the lookup
+        _device = dev
+        _generation += 1
+        lock.unlock()
+    }
+
+    private func detach(_ dev: IOHIDDevice) {
+        lock.lock(); defer { lock.unlock() }
+        guard let current = _device, CFEqual(current, dev) else { return }
+        _device = nil
+        _generation += 1
+    }
+
+    /// A reply only counts if it echoes the command and its first two arguments.
+    /// Anything else — a late answer to a request that already timed out, or an
+    /// unsolicited report — is dropped rather than mistaken for this one's.
+    private func received(_ report: [UInt8]) {
+        lock.lock()
+        guard let want = awaiting, report.starts(with: want) else { lock.unlock(); return }
+        reply = report
+        awaiting = nil
+        lock.unlock()
+        replied.signal()
+    }
+
+    /// One request and its reply, or nil if the keyboard did not answer — asleep,
+    /// busy, or gone. A nil here is not evidence of an unplug.
+    func exchange(_ cmd: UInt8, _ args: [UInt8]) -> [UInt8]? {
+        guard let dev = device else { return nil }
         var p = [UInt8](repeating: 0, count: REPORT)
         p[0] = cmd
         for (i, a) in args.enumerated() where i + 1 < REPORT { p[i + 1] = a }
-        box.last = nil
-        guard IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 0, p, p.count) == kIOReturnSuccess
-        else { gone = true; return nil }
-        CFRunLoopRunInMode(.defaultMode, 0.5, false)
-        // 0xff in byte 0 means "firmware does not implement this command".
-        if let r = box.last, r.first == 0xff { return nil }
-        return box.last
+
+        while replied.wait(timeout: .now()) == .success {}   // drop a signal left by a late reply
+        lock.lock(); awaiting = Array(p[0..<min(3, 1 + args.count)]); reply = nil; lock.unlock()
+
+        let sent = IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, 0, p, p.count) == kIOReturnSuccess
+        let answered = sent && replied.wait(timeout: .now() + HID_REPLY_TIMEOUT) == .success
+
+        lock.lock(); defer { awaiting = nil; reply = nil; lock.unlock() }
+        return answered ? reply : nil
     }
+
+    // VIA custom-menu access. Everything here is CUSTOM_MENU_SET_VALUE (0x07):
+    // RAM only, effective immediately, lost on a power cycle. 0x09 (save) is
+    // never sent, so nothing written here outlives an unplug.
 
     func get(_ channel: UInt8, _ value: UInt8, _ extra: [UInt8] = []) -> [UInt8]? {
-        send(0x08, [channel, value] + extra)
+        exchange(0x08, [channel, value] + extra)
     }
 
-    func set(_ channel: UInt8, _ value: UInt8, _ payload: [UInt8]) {
-        send(0x07, [channel, value] + payload)
+    func set(_ channel: UInt8, _ value: UInt8, _ payload: [UInt8]) -> Bool {
+        exchange(0x07, [channel, value] + payload) != nil
     }
 
-    func readText(slot: Int) -> String {
+    func screenMode() -> UInt8? { get(CH_SCREEN, VAL_EFFECT).flatMap { $0.count > 3 ? $0[3] : nil } }
+    func setScreenMode(_ m: UInt8) -> Bool { set(CH_SCREEN, VAL_EFFECT, [m]) }
+
+    func readText(slot: Int) -> String? {
         var out = ""
         var offset = 0
         while offset < TEXT_LEN {
             let n = min(TEXT_LEN - offset, 26)
             guard let r = get(CH_SCREEN, VAL_TEXT, [UInt8(slot), UInt8(offset), UInt8(n)]),
-                  r.count >= 6 + n else { break }
+                  r.count >= 6 + n else { return nil }
             out += String(bytes: r[6..<(6 + n)].filter { $0 != 0 }, encoding: .ascii) ?? ""
             offset += n
         }
         return out
     }
 
+    func readTexts() -> [String]? {
+        var texts: [String] = []
+        for slot in 0..<TEXT_SLOTS {
+            guard let t = readText(slot: slot) else { return nil }
+            texts.append(t)
+        }
+        return texts
+    }
+
     /// Always writes the full 30 bytes so a shorter string cannot leave a tail behind.
-    func writeText(slot: Int, _ text: String) {
+    func writeText(slot: Int, _ text: String) -> Bool {
         var bytes = Array(text.uppercased().unicodeScalars.compactMap { $0.isASCII ? UInt8($0.value) : 0x20 })
         bytes = Array(bytes.prefix(TEXT_LEN))
         bytes += [UInt8](repeating: 0, count: TEXT_LEN - bytes.count)
         var offset = 0
         while offset < TEXT_LEN {
             let n = min(TEXT_LEN - offset, 26)
-            set(CH_SCREEN, VAL_TEXT, [UInt8(slot), UInt8(offset), UInt8(n)] + Array(bytes[offset..<(offset + n)]))
+            guard set(CH_SCREEN, VAL_TEXT, [UInt8(slot), UInt8(offset), UInt8(n)] + Array(bytes[offset..<(offset + n)]))
+            else { return false }
             offset += n
         }
+        return true
     }
 
-    func screenMode() -> UInt8? { get(CH_SCREEN, VAL_EFFECT).flatMap { $0.count > 3 ? $0[3] : nil } }
-    func setScreenMode(_ m: UInt8) { set(CH_SCREEN, VAL_EFFECT, [m]) }
+    func writeTexts(_ texts: [String]) -> Bool {
+        for (slot, t) in texts.enumerated() where slot < TEXT_SLOTS {
+            guard writeText(slot: slot, t) else { return false }
+        }
+        return true
+    }
 }
 
 // MARK: - CDC serial transport (pixel frames)
@@ -475,6 +574,18 @@ final class SerialPort {
             got += chunk[0..<n]
         }
         return got.count == SERIAL_BUF ? got : nil
+    }
+
+    /// Does the link answer at all? Run before committing the screen to CUSTOM.
+    ///
+    /// A lone frame header is the probe: it is answered reliably, and a transfer
+    /// cut short after it recovers on the next upload's header — which always
+    /// follows straight after. The firmware query VIA uses (0xEF) gets no reply
+    /// from this keyboard even with the link healthy, and 0xF0 belongs to the
+    /// firmware-update sequence: not something to probe with.
+    func ping() -> Bool {
+        guard let r = packet(CMD_FRAME_HEADER, [1, 10, UInt8(SCREEN_ROWS), UInt8(SCREEN_COLS)]) else { return false }
+        return r.count > 6 && r[5] != 0xEE
     }
 
     /// Upload one frame. Deliberately does not touch the screen mode: the frame
@@ -568,29 +679,45 @@ func buildFrame(_ agg: [String: Activity]) -> [UInt8] {
     return pixels.flatMap { $0 }
 }
 
-// MARK: - Baseline (what the keyboard looked like before we touched it)
+// MARK: - Takeover (what to hand back)
 
-struct Baseline: Codable {
-    var texts: [String]
-    var screenMode: UInt8
+/// What the screen was doing when it was borrowed, so it can be handed back
+/// exactly as it was.
+///
+/// Taken at the moment of borrowing, not at daemon startup: a snapshot from
+/// startup goes stale the moment the user changes a text or a mode, and
+/// restoring it would quietly overwrite their newer choice. Kept on disk while
+/// held, so a daemon that dies mid-borrow is followed by one that puts the
+/// screen back before doing anything else.
+struct Takeover: Codable {
+    /// The user's own screen mode — what the screen returns to.
+    var userMode: UInt8
+    /// The user's text slots, present only once ours have been written over them.
+    var userTexts: [String]?
+
+    func save() {
+        try? ensureStateDir()
+        try? JSONEncoder().encode(self).write(to: takeoverURL)
+    }
+
+    static func load() -> Takeover? {
+        (try? Data(contentsOf: takeoverURL)).flatMap { try? JSONDecoder().decode(Takeover.self, from: $0) }
+    }
+
+    static func clear() { try? FileManager.default.removeItem(at: takeoverURL) }
 }
 
-func saveBaselineIfNeeded(_ kb: Keyboard) -> Baseline? {
-    if let data = try? Data(contentsOf: baselineURL),
-       let b = try? JSONDecoder().decode(Baseline.self, from: data) { return b }
-    guard let mode = kb.screenMode() else { return nil }
-    let b = Baseline(texts: (0..<TEXT_SLOTS).map { kb.readText(slot: $0) }, screenMode: mode)
-    try? ensureStateDir()
-    try? JSONEncoder().encode(b).write(to: baselineURL)
-    return b
-}
-
-/// Put the user's own texts back and leave the screen in the configured resting
-/// mode — which is *not* necessarily the mode the daemon happened to find at
-/// startup, since that may have been a transient one.
-func restore(_ kb: Keyboard, _ b: Baseline, idleMode: UInt8?) {
-    for (i, t) in b.texts.enumerated() where i < TEXT_SLOTS { kb.writeText(slot: i, t) }
-    kb.setScreenMode(idleMode ?? b.screenMode)
+/// Put a borrowed screen back. Returns false if the keyboard did not answer,
+/// in which case nothing is assumed restored and the caller tries again later.
+///
+/// The mode is written only if it differs: re-entering CUSTOM makes the
+/// firmware reload the frame it has stored, so even a same-value write is not
+/// free.
+func handBack(_ t: Takeover, via link: HIDLink) -> Bool {
+    if let texts = t.userTexts, !link.writeTexts(texts) { return false }
+    guard let now = link.screenMode() else { return false }
+    if now != t.userMode, !link.setScreenMode(t.userMode) { return false }
+    return true
 }
 
 // MARK: - Daemon
@@ -673,184 +800,348 @@ final class RemoteListener {
     }
 }
 
-/// Owns the keyboard for the daemon's lifetime, surviving unplug/replug.
-/// A missing keyboard is a normal state here, not a fatal one: hooks keep
-/// recording activity regardless, and the screen catches up on reconnect.
+/// Drives the screen on the user's behalf, for the daemon's lifetime.
+///
+/// The user's own screen mode decides how, so no setting of theirs is ever
+/// changed behind their back:
+///
+/// - Screen on CUSTOM: that is the status display. It is drawn into in place —
+///   status while agents run, a dim dashboard while they don't — and the mode
+///   is never touched.
+/// - Screen on anything else: it is borrowed only while an agent is active,
+///   and handed back — mode and texts exactly as they were — once all are idle.
+/// - The user switching the mode while it is borrowed is them taking it back.
+///   It is released at once and not borrowed again until the agents next go
+///   idle. (Switching *to* CUSTOM asks for the status display instead.)
+///
+/// The keyboard sleeps after five idle minutes and stops answering until a key
+/// wakes it. That is expected, not an unplug: the renderer backs off without
+/// touching anything, and redraws once it answers again.
 final class Renderer {
-    private var kb: Keyboard?
-    private var baseline: Baseline?
-    private var rendered: String?
-    private var lastAttempt = Date.distantPast
-    private var lastVerify = Date.distantPast
-    private var serial: SerialPort?
-    private var lastSerialAttempt = Date.distantPast
-    private var pixelDisabled = false
+    private enum Surface { case pixel, text }
+
+    private let link: HIDLink
     private let config = Config.load()
 
-    /// The daemon caches what it believes is on screen so it does not rewrite on
-    /// every tick. That cache goes stale the moment anything else touches the
-    /// keyboard — the physical mode key, VIA, or another copy of this tool — and
-    /// without this check the screen would stay wrong forever. So periodically
-    /// read the device back and drop the cache when it disagrees.
-    private func verifyIfDue(_ kb: Keyboard) {
-        guard let shown = rendered,
-              Date().timeIntervalSince(lastVerify) > VERIFY_INTERVAL else { return }
-        lastVerify = Date()
-        guard let mode = kb.screenMode() else { return }   // read failed: leave it be
-        // Frame data has no read-back, so in pixel mode the screen mode is all
-        // there is to check; in text mode slot 0 can be compared too.
-        var stale = mode != activeMode
-        if mode == MODE_SCROLL {
-            let slot0 = kb.readText(slot: 0)
-            guard !kb.gone else { return }
-            stale = stale || slot0 != shown.uppercased()
+    // Presence and sleep
+    private var seenGeneration: Int?
+    private var asleep = false
+    private var sleepBackoff = SLEEP_BACKOFF_MIN
+    private var nextWakeProbe = Date.distantPast
+
+    // The pixel (CDC) link
+    private var serial: SerialPort?
+    private var cdcUp = false
+    private var cdcBackoff = CDC_RETRY_MIN
+    private var nextCdcTry = Date.distantPast
+
+    // Ownership of the screen
+    private var surface: Surface?            // nil: the screen is the user's
+    private var userMode: UInt8 = MODE_INFO  // while held: the mode it goes back to
+    private var userTexts: [String]?         // while held: their slots, once ours are written over them
+    private var onScreen: UInt8?             // the mode the screen was last seen or left in
+    private var drawn: String?               // what our surface shows, to skip redundant writes
+    private var dismissed = false            // taken back by the user; wait for the agents to go idle
+    private var lastCheck = Date.distantPast
+    private var lastNote: String?
+    private var recovered = false
+
+    private var holding: Bool { surface != nil }
+    private var resident: Bool { holding && userMode == MODE_CUSTOM }
+
+    init(link: HIDLink) { self.link = link }
+
+    func update(_ agg: [String: Activity]) {
+        trackPresence()
+        guard link.device != nil, awake() else { return }
+
+        if !recovered {
+            // A takeover on disk now means the previous daemon died holding the
+            // screen. Give it back before doing anything else.
+            if let stale = Takeover.load() {
+                guard handBack(stale, via: link) else { return fellAsleep() }
+                Takeover.clear()
+                log("handed back a screen left borrowed by a previous run")
+            }
+            recovered = true
         }
-        if stale {
-            print("[\(stamp())] screen changed externally (mode=\(mode)) — reasserting")
-            rendered = nil
+
+        let active = !agg.isEmpty
+        if !active { dismissed = false }
+
+        if Date().timeIntervalSince(lastCheck) >= MODE_CHECK_INTERVAL {
+            lastCheck = Date()
+            guard let mode = link.screenMode() else { return fellAsleep() }
+            if holding, let expected = onScreen, mode != expected {
+                return userSwitched(to: mode, active: active)
+            }
+            onScreen = mode
+            if !holding, mode == MODE_CUSTOM, config.display != .text {
+                // The user's own mode is CUSTOM: that is the status display. This is
+                // also how a fresh start, or a switch to CUSTOM, picks it up — and
+                // switching there is asking for it, so it undoes a dismissal.
+                surface = .pixel; userMode = MODE_CUSTOM; userTexts = nil; drawn = nil
+                dismissed = false
+                persist()
+            }
+        }
+
+        if !active { return goIdle() }
+        if dismissed { return }
+        if holding { refresh(agg) } else { borrow(agg) }
+    }
+
+    /// SIGTERM: give back anything borrowed. A resident screen keeps its last frame.
+    func shutdown() {
+        guard holding, userMode != MODE_CUSTOM || userTexts != nil else { return }
+        if handBack(Takeover(userMode: userMode, userTexts: userTexts), via: link) {
+            Takeover.clear()
+            log("screen handed back (\(modeName(userMode)))")
+        }   // otherwise it stays on disk for the next run to hand back
+    }
+
+    // MARK: Transitions
+
+    private func borrow(_ agg: [String: Activity]) {
+        guard let mode = link.screenMode() else { return fellAsleep() }
+        onScreen = mode
+        userMode = mode; userTexts = nil; drawn = nil
+
+        if config.display != .text, mode == MODE_CUSTOM || pixelLinkAnswers() {
+            surface = .pixel
+            persist()                                    // on disk before the screen is touched
+            guard setMode(MODE_CUSTOM) else { return fellAsleep() }
+            if drawPixel(agg) { return }
+            // The link died between the check and the frame. Never leave the
+            // screen on CUSTOM showing the firmware's stored frame.
+            guard setMode(mode) else { return fellAsleep() }
+            surface = nil
+            persist()
+        }
+        guard config.display != .pixel else {
+            return note("pixel link down and display is pixel-only — leaving the screen alone")
+        }
+        guard let texts = link.readTexts() else { return fellAsleep() }
+        surface = .text; userTexts = texts
+        persist()
+        guard enterText(agg) else { return fellAsleep() }
+    }
+
+    private func refresh(_ agg: [String: Activity]) {
+        if surface == .text {
+            guard config.display == .mixed, pixelLinkAnswers() else { return drawText(agg) }
+            // Mixed and the pixel link answers again: their texts back, then CUSTOM.
+            if let texts = userTexts { guard link.writeTexts(texts) else { return fellAsleep() } }
+            userTexts = nil; surface = .pixel; drawn = nil
+            persist()
+            guard setMode(MODE_CUSTOM) else { return fellAsleep() }
+        }
+        if drawPixel(agg) { return }
+
+        switch config.display {
+        case .mixed:
+            log("pixel link down — showing text until it answers again")
+            guard let texts = link.readTexts() else { return fellAsleep() }
+            surface = .text; userTexts = texts
+            persist()
+            guard enterText(agg) else { return fellAsleep() }
+        case .pixel where !resident:
+            release()      // don't leave the stored frame up; borrowed again once the link answers
+        default:
+            break          // resident: CUSTOM is the user's own mode, nothing better to show
         }
     }
 
-    /// Pixel mode degrades to text when the serial side is unusable, so the
-    /// display stays useful instead of going blank.
-    private var activeDisplay: Display { pixelDisabled ? .text : config.display }
-    private var activeMode: UInt8 { activeDisplay == .pixel ? MODE_CUSTOM : MODE_SCROLL }
+    private func goIdle() {
+        guard holding else { return }
+        guard resident else { return release() }
+        if surface == .text {
+            // The busy-time fallback is over: their texts, then CUSTOM, back.
+            if let texts = userTexts { guard link.writeTexts(texts) else { return fellAsleep() } }
+            userTexts = nil; surface = .pixel; drawn = nil
+            persist()
+            guard setMode(MODE_CUSTOM) else { return fellAsleep() }
+        }
+        _ = drawPixel([:])      // the dim dashboard; retried on the link's schedule if it is down
+    }
 
-    /// Resolved once and held for the daemon's lifetime; only a physical
-    /// disconnect drops it. Reconnect attempts are rate limited so a keyboard
-    /// that is simply absent does not get probed on every tick.
-    private func serialPort() -> SerialPort? {
-        if let serial { return serial }
-        guard Date().timeIntervalSince(lastSerialAttempt) > SERIAL_RETRY_INTERVAL else { return nil }
-        lastSerialAttempt = Date()
-        guard let path = findSerialPath(), let port = SerialPort(path: path) else { return nil }
-        print("[\(stamp())] serial: \(path)")
-        serial = port
+    private func release() {
+        guard handBack(Takeover(userMode: userMode, userTexts: userTexts), via: link) else {
+            return fellAsleep()      // stays held; tried again once the keyboard answers
+        }
+        log("idle — screen handed back (\(modeName(userMode)))")
+        surface = nil; userTexts = nil; onScreen = userMode; drawn = nil
+        persist()
+    }
+
+    private func userSwitched(to mode: UInt8, active: Bool) {
+        if let texts = userTexts, !link.writeTexts(texts) { return fellAsleep() }
+        log("you switched the screen to \(modeName(mode)) — leaving it to you")
+        surface = nil; userTexts = nil; onScreen = mode; drawn = nil
+        persist()
+        // Switching *to* CUSTOM asks for the status display; anything else is a dismissal.
+        dismissed = active && !(mode == MODE_CUSTOM && config.display != .text)
+    }
+
+    // MARK: Drawing
+
+    private func drawPixel(_ agg: [String: Activity]) -> Bool {
+        let text = render(agg)
+        let key = "pixel:" + (text.isEmpty ? IDLE_KEY : text)
+        if drawn == key { return true }
+        guard let port = pixelLink() else { return false }
+        guard port.sendFrame(buildFrame(agg), rows: SCREEN_ROWS, cols: SCREEN_COLS) else {
+            cdcFailed(); return false
+        }
+        linkUp()
+        drawn = key
+        log(text.isEmpty ? "idle — dashboard" : text)
+        return true
+    }
+
+    /// Our status line in slot 0 and the other slots blank, so only it scrolls.
+    private func enterText(_ agg: [String: Activity]) -> Bool {
+        for slot in 1..<TEXT_SLOTS { guard link.writeText(slot: slot, "") else { return false } }
+        drawn = nil
+        guard setMode(MODE_SCROLL) else { return false }
+        drawText(agg)
+        return drawn != nil
+    }
+
+    private func drawText(_ agg: [String: Activity]) {
+        let text = render(agg)
+        guard drawn != "text:" + text else { return }
+        guard link.writeText(slot: 0, text) else { return fellAsleep() }
+        drawn = "text:" + text
+        log("\(text) (text)")
+    }
+
+    /// Change the screen mode, skipping the write when it is already there:
+    /// re-entering CUSTOM makes the firmware reload its stored frame, so even a
+    /// same-value write is not free.
+    private func setMode(_ m: UInt8) -> Bool {
+        if onScreen == m { return true }
+        guard link.setScreenMode(m) else { return false }
+        onScreen = m
+        return true
+    }
+
+    private func persist() {
+        if holding, userMode != MODE_CUSTOM || userTexts != nil {
+            Takeover(userMode: userMode, userTexts: userTexts).save()
+        } else {
+            Takeover.clear()
+        }
+    }
+
+    // MARK: The pixel link
+
+    /// The pixel link, if it is open and not sitting out a retry backoff. No I/O.
+    /// It is opened once per connection, and when it stops answering it is left
+    /// alone on a growing backoff — hammering a dead link every few seconds is
+    /// part of how it used to stay dead.
+    private func pixelLink() -> SerialPort? {
+        if let serial, cdcUp { return serial }
+        guard Date() >= nextCdcTry else { return nil }
+        if serial == nil, let path = findSerialPath() { serial = SerialPort(path: path) }
+        guard let port = serial else { cdcFailed(); return nil }
         return port
     }
 
-    /// Send on the held connection and keep that connection whatever happens.
-    ///
-    /// This keyboard's CDC endpoint sometimes stops answering entirely — every
-    /// command, down to a bare firmware query, reads back nothing, and only a
-    /// physical replug revives it. HID is unaffected throughout. It has been
-    /// seen twice and the trigger is not known: transport load, interleaved HID
-    /// reads and writes, open/close cycling, idle gaps up to 20s and truncated
-    /// transfers were each tested against it and none reproduced it. See
-    /// DP104-PROTOCOL.md §5.1 for the experiments.
-    ///
-    /// So holding one descriptor is caution, not a proven remedy, and there is
-    /// no reopen-as-recovery here: a failed frame is just a failed frame, and
-    /// the caller degrades to the text display rather than churning the port on
-    /// a hunch. Recovery lives in retryPixelIfDue().
-    private func sendPixelFrame(_ payload: [UInt8]) -> Bool {
-        guard let port = serialPort() else { return false }
-        return port.sendFrame(payload, rows: SCREEN_ROWS, cols: SCREEN_COLS)
+    /// Before switching the screen to CUSTOM: does the link answer? Switching
+    /// first and finding out after would show the firmware's stored frame.
+    private func pixelLinkAnswers() -> Bool {
+        guard let port = pixelLink() else { return false }
+        guard port.ping() else { cdcFailed(); return false }
+        linkUp()
+        return true
     }
 
-    private func serialFailed() {
-        pixelDisabled = true
-        lastSerialAttempt = Date()      // note: the port stays open on purpose
-        print("[\(stamp())] pixel frame failed — falling back to text; "
-              + "retrying in \(Int(SERIAL_RETRY_INTERVAL))s. "
-              + "If it never recovers, replug the keyboard: the CDC endpoint "
-              + "sometimes stops answering until it is physically reconnected.")
+    private func linkUp() {
+        if !cdcUp { log("pixel link up") }
+        cdcUp = true
+        cdcBackoff = CDC_RETRY_MIN
     }
 
-    private func retryPixelIfDue() {
-        guard config.display == .pixel, pixelDisabled,
-              Date().timeIntervalSince(lastSerialAttempt) >= SERIAL_RETRY_INTERVAL else { return }
-        pixelDisabled = false
-        rendered = nil
-        print("[\(stamp())] retrying pixel display")
+    private func cdcFailed() {
+        log("pixel link not answering — next try in \(Int(cdcBackoff))s")
+        cdcUp = false
+        nextCdcTry = Date().addingTimeInterval(cdcBackoff)
+        cdcBackoff = min(cdcBackoff * 2, CDC_RETRY_MAX)
     }
 
-    private func acquire() -> (Keyboard, Baseline)? {
-        if let kb, !kb.gone, let baseline { return (kb, baseline) }
-        if kb != nil {
-            print("[\(stamp())] keyboard disconnected")
-            kb = nil
-            rendered = nil          // whatever it was showing is gone with it
-            // A physical reconnect gives the CDC endpoint a fresh lifetime.
-            // Drop the permanent text fallback and retry pixel transport from
-            // scratch once the HID side is available again.
-            serial = nil
-            lastSerialAttempt = Date.distantPast
-            pixelDisabled = false
+    // MARK: Presence and sleep
+
+    private func trackPresence() {
+        let gen = link.generation
+        guard gen != seenGeneration else { return }
+        let first = seenGeneration == nil
+        seenGeneration = gen
+        if link.device != nil { log("keyboard connected") }
+        else { log(first ? "waiting for the keyboard" : "keyboard unplugged") }
+        // An unplug is a power cycle: the keyboard comes back on its own saved
+        // settings, so anything borrowed is already undone. (The very first
+        // sighting is not one — a takeover on disk then still needs handing back.)
+        if !first { surface = nil; userTexts = nil; Takeover.clear() }
+        onScreen = nil; drawn = nil; dismissed = false; lastCheck = .distantPast
+        serial = nil; cdcUp = false; cdcBackoff = CDC_RETRY_MIN; nextCdcTry = .distantPast
+        asleep = false; sleepBackoff = SLEEP_BACKOFF_MIN
+    }
+
+    private func awake() -> Bool {
+        guard asleep else { return true }
+        guard Date() >= nextWakeProbe else { return false }
+        guard link.screenMode() != nil else {
+            sleepBackoff = min(sleepBackoff * 2, SLEEP_BACKOFF_MAX)
+            nextWakeProbe = Date().addingTimeInterval(sleepBackoff)
+            return false
         }
-        guard Date().timeIntervalSince(lastAttempt) > RECONNECT_INTERVAL else { return nil }
-        lastAttempt = Date()
-        guard let fresh = Keyboard(), let b = saveBaselineIfNeeded(fresh) else { return nil }
-        kb = fresh
-        baseline = b
-        rendered = nil              // force a redraw so state survives the gap
-        print("[\(stamp())] keyboard connected — baseline mode=\(b.screenMode) texts=\(b.texts)")
-        return (fresh, b)
+        asleep = false
+        sleepBackoff = SLEEP_BACKOFF_MIN
+        log("keyboard awake")
+        // It may have reloaded its stored frame and lost the pixel link while it
+        // slept: redraw, and reopen the link once. The mode is kept — sleeping
+        // does not change it, so a different mode now is the user's doing.
+        drawn = nil
+        serial = nil; cdcUp = false; cdcBackoff = CDC_RETRY_MIN; nextCdcTry = .distantPast
+        return true
     }
 
-    func update(_ agg: [String: Activity]) {
-        guard let (kb, baseline) = acquire() else { return }
-        verifyIfDue(kb)
-        retryPixelIfDue()
-
-        let text = render(agg)
-        if text.isEmpty, config.idleKeep, activeDisplay == .pixel {
-            guard rendered != IDLE_FRAME else { return }
-            if rendered == nil { kb.setScreenMode(MODE_CUSTOM) }
-            guard sendPixelFrame(buildFrame([:])) else { serialFailed(); rendered = nil; return }
-            rendered = IDLE_FRAME
-            print("[\(stamp())] idle — holding the pixel display")
-            return
-        }
-        if text.isEmpty {
-            guard rendered != nil else { return }
-            restore(kb, baseline, idleMode: config.idleMode)
-            rendered = nil
-            print("[\(stamp())] idle — keyboard restored")
-            return
-        }
-        guard rendered != text else { return }
-        let takingOver = rendered == nil
-
-        switch activeDisplay {
-        case .text:
-            kb.writeText(slot: 0, text)
-            if takingOver {         // clear the other slots so only our line scrolls
-                for slot in 1..<TEXT_SLOTS { kb.writeText(slot: slot, "") }
-                kb.setScreenMode(MODE_SCROLL)
-            }
-            guard !kb.gone else { rendered = nil; return }
-
-        case .pixel:
-            // Enter CUSTOM before the first frame; after that upload only.
-            // Re-entering the mode would make the firmware reload its own stored
-            // frame and discard ours, so never round-trip the mode here.
-            if takingOver { kb.setScreenMode(MODE_CUSTOM) }
-            guard sendPixelFrame(buildFrame(agg)) else {
-                serialFailed(); rendered = nil; return
-            }
-        }
-
-        rendered = text
-        print("[\(stamp())] \(text)")
+    private func fellAsleep() {
+        guard !asleep else { return }
+        asleep = true
+        sleepBackoff = SLEEP_BACKOFF_MIN
+        nextWakeProbe = Date().addingTimeInterval(sleepBackoff)
+        log("keyboard not answering (asleep?) — waiting for it")
     }
 
-    func restoreNow() {
-        guard let kb, let baseline, rendered != nil else { return }
-        restore(kb, baseline, idleMode: config.idleMode)
+    // MARK: Logging
+
+    private func log(_ s: String) { print("[\(stamp())] \(s)"); lastNote = nil }
+
+    /// Log a standing condition once rather than on every tick it persists.
+    private func note(_ s: String) {
+        guard s != lastNote else { return }
+        print("[\(stamp())] \(s)")
+        lastNote = s
     }
+}
+
+func modeName(_ m: UInt8) -> String {
+    screenModes.first { $0.value == m }.map { $0.key.uppercased() } ?? "mode \(m)"
 }
 
 var signalSources: [DispatchSourceSignal] = []
 
 func runDaemon() {
-    setvbuf(stdout, nil, _IOLBF, 0)   // line-buffered so logs appear when piped to a file
-    print("dp104status: watching \(stateURL.path)")
+    let cfg = Config.load()
+    print("dp104status: watching \(stateURL.path) — display \(cfg.display.rawValue)")
 
-    let renderer = Renderer()
+    let link = HIDLink()
+    let renderer = Renderer(link: link)
 
     var remote: RemoteListener?
-    if let port = Config.load().remotePort {
+    if let port = cfg.remotePort {
         remote = RemoteListener(port: port)
         print(remote == nil
               ? "remote: could not bind 127.0.0.1:\(port) — is another daemon running?"
@@ -861,7 +1152,7 @@ func runDaemon() {
     for sig in [SIGINT, SIGTERM] {
         signal(sig, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-        src.setEventHandler { renderer.restoreNow(); print("\nrestored"); exit(0) }
+        src.setEventHandler { renderer.shutdown(); print("\nstopped"); exit(0) }
         src.resume()
         signalSources.append(src)
     }
@@ -898,6 +1189,7 @@ func printHooks(product: String) {
 
 // MARK: - Entry point
 
+setvbuf(stdout, nil, _IOLBF, 0)   // line-buffered: output survives an abnormal exit, and reaches log files promptly
 let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "hook":
@@ -914,16 +1206,37 @@ case "status":
     for (k, o) in loadState().owners.sorted(by: { $0.key < $1.key }) {
         print("  \(k)  \(o.activity.rawValue)")
     }
+    if let t = Takeover.load() {
+        print("screen borrowed — goes back to \(modeName(t.userMode))"
+              + (t.userTexts == nil ? "" : ", with your texts"))
+    }
+
+case "probe":
+    // Read-only look at the keyboard: what the screen is doing and how soon it sleeps.
+    let link = HIDLink()
+    guard link.device != nil else { print("no keyboard on USB"); exit(1) }
+    func value(_ ch: UInt8, _ v: UInt8) -> UInt8? { link.get(ch, v).flatMap { $0.count > 3 ? $0[3] : nil } }
+    let sleeps: [UInt8: String] = [0: "never", 1: "5 min", 2: "15 min", 3: "30 min", 4: "1 h", 5: "3 h", 6: "6 h"]
+    guard let mode = value(CH_SCREEN, VAL_EFFECT) else {
+        print("keyboard did not answer — asleep? press a key and try again"); exit(1)
+    }
+    print("screen mode : \(modeName(mode))")
+    print("brightness  : " + (value(CH_SCREEN, VAL_BRIGHTNESS).map { "\($0)/255" } ?? "—"))
+    print("sleeps after: " + (value(17, 2).map { sleeps[$0] ?? "setting \($0)" } ?? "—"))
+    print("pixel link  : " + (findSerialPath() ?? "no serial node"))
+    if let t = Takeover.load() { print("borrowed    : goes back to \(modeName(t.userMode))") }
 
 case "restore":
-    guard let kb = Keyboard() else { print("no keyboard"); exit(1) }
-    guard let data = try? Data(contentsOf: baselineURL),
-          let b = try? JSONDecoder().decode(Baseline.self, from: data) else {
-        print("no saved baseline"); exit(1)
+    // Hand back a borrowed screen by hand. With the daemon running it will
+    // borrow again while agents are active — stop it first to keep it back.
+    let link = HIDLink()
+    guard link.device != nil else { print("no keyboard on USB"); exit(1) }
+    guard let t = Takeover.load() else { print("nothing borrowed — the screen is already yours"); exit(0) }
+    guard handBack(t, via: link) else {
+        print("keyboard did not answer — asleep? press a key and try again"); exit(1)
     }
-    let idle = Config.load().idleMode
-    restore(kb, b, idleMode: idle)
-    print("restored: mode=\(idle ?? b.screenMode) texts=\(b.texts)")
+    Takeover.clear()
+    print("handed back: \(modeName(t.userMode))" + (t.userTexts.map { ", texts \($0)" } ?? ""))
 
 case "hooks":
     guard let p = args.dropFirst().first, p == "claude" || p == "codex" else {
@@ -940,6 +1253,7 @@ case "pixel-test":
         exit(1)
     }
     print("opened      : ok")
+    print("ping        : \(port.ping() ? "answered" : "no answer")")
     let hdr = port.packet(CMD_FRAME_HEADER, [1, 10, UInt8(SCREEN_ROWS), UInt8(SCREEN_COLS)])
     if let h = hdr {
         print("header resp : \(h.prefix(10).map { String(format: "%02x", $0) }.joined(separator: " "))")
@@ -977,22 +1291,9 @@ case "config":
     let key = args.dropFirst().first
     let want = args.dropFirst(2).first
     switch (key, want) {
-    case ("idle", .some(let v)):
-        if v == "keep" {
-            cfg.idleKeep = true
-        } else if v == "restore" {
-            cfg.idleKeep = false
-            cfg.idleMode = nil
-        } else if let m = screenModes[v.lowercased()] {
-            cfg.idleKeep = false
-            cfg.idleMode = m
-        } else {
-            print("unknown mode \(v) — one of: \(screenModes.keys.sorted().joined(separator: ", ")), restore, keep")
-            exit(2)
-        }
     case ("display", .some(let v)):
         guard let d = Display(rawValue: v.lowercased()) else {
-            print("unknown display \(v) — pixel or text"); exit(2)
+            print("unknown display \(v) — mixed, pixel or text"); exit(2)
         }
         cfg.display = d
     case ("remote", .some(let v)):
@@ -1003,21 +1304,27 @@ case "config":
         } else {
             print("remote takes a port above 1023, or off"); exit(2)
         }
-    case (.some(let k), _) where !["idle", "display", "remote"].contains(k):
-        print("usage: dp104status config [idle <mode|restore|keep>"
-              + "|display <pixel|text>|remote <port|off>]"); exit(2)
+    case ("idle", _):
+        print("""
+        There is no idle setting any more: the screen follows your own mode.
+          leave it on CUSTOM   the status display stays up, dim while agents are idle
+          leave it elsewhere   borrowed only while agents run, then handed back
+        """)
+        exit(2)
+    case (.some(let k), _) where !["display", "remote"].contains(k):
+        print("usage: dp104status config [display <mixed|pixel|text>] [remote <port|off>]"); exit(2)
     default:
         break
     }
     try? cfg.save()   // always rewrite, so every field is present and explicit
 
-    let idleName = cfg.idleMode.flatMap { m in screenModes.first { $0.value == m }?.key }
-    print("display  : \(cfg.display.rawValue)")
-    print("idle mode: " + (cfg.idleKeep
-        ? "keep (stay on the pixel display, both halves dim)"
-        : (idleName ?? "restore (whatever was there at startup)")))
-    print("remote   : " + (cfg.remotePort.map { "127.0.0.1:\($0)" } ?? "off"))
-    print("config   : \(configURL.path)")
+    print("display : \(cfg.display.rawValue)   (mixed | pixel | text)")
+    print("remote  : " + (cfg.remotePort.map { "127.0.0.1:\($0)" } ?? "off"))
+    print("config  : \(configURL.path)")
+    if key != nil {
+        print("\nThe daemon reads this at start — restart it to apply:")
+        print("  launchctl kickstart -k gui/$(id -u)/com.skyler.dp104status")
+    }
 
 case "remote-hook":
     guard let p = args.dropFirst().first, products.contains(p) else {
@@ -1046,10 +1353,18 @@ default:
     print("""
     dp104status — agent activity on a Ticktype DP104 screen
 
-      dp104status daemon                own the keyboard, render the aggregate state
-      dp104status hook <claude|codex>   record one hook event from stdin
-      dp104status status                print what the daemon would render
-      dp104status restore               put the keyboard back
-      dp104status hooks <claude|codex>  print hook config to install
+      dp104status daemon                  own the screen, render the aggregate state
+      dp104status hook <claude|codex>     record one hook event from stdin
+      dp104status status                  what the daemon would render, and what it holds
+      dp104status probe                   read-only look at the keyboard
+      dp104status restore                 hand a borrowed screen back by hand
+      dp104status config [display <mixed|pixel|text>] [remote <port|off>]
+      dp104status hooks <claude|codex>    print hook config to install
+      dp104status remote-hook <product>   print the forwarder for an SSH host
+      dp104status preview <a> <b>         draw a frame in the terminal
+      dp104status pixel-test              exercise the pixel link (daemon stopped)
+
+    The screen follows your own mode: leave it on CUSTOM for a permanent status
+    display, or anywhere else to have it borrowed only while agents run.
     """)
 }
