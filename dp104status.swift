@@ -807,7 +807,8 @@ final class RemoteListener {
 ///
 /// - Screen on CUSTOM: that is the status display. It is drawn into in place —
 ///   status while agents run, a dim dashboard while they don't — and the mode
-///   is never touched.
+///   is never touched, not even when the pixel link is down and nothing can be
+///   drawn. (With display text, CUSTOM is borrowed like any other mode.)
 /// - Screen on anything else: it is borrowed only while an agent is active,
 ///   and handed back — mode and texts exactly as they were — once all are idle.
 /// - The user switching the mode while it is borrowed is them taking it back.
@@ -907,7 +908,16 @@ final class Renderer {
         onScreen = mode
         userMode = mode; userTexts = nil; drawn = nil
 
-        if config.display != .text, mode == MODE_CUSTOM || pixelLinkAnswers() {
+        if config.display != .text, mode == MODE_CUSTOM {
+            // Already on CUSTOM: that is the status display. Draw into it if the
+            // pixel link allows, and otherwise leave it be — never switch away from
+            // the user's own CUSTOM, not even to fall back to text.
+            surface = .pixel; dismissed = false
+            persist()
+            _ = drawPixel(agg)
+            return
+        }
+        if config.display != .text, pixelLinkAnswers() {
             surface = .pixel
             persist()                                    // on disk before the screen is touched
             guard setMode(MODE_CUSTOM) else { return fellAsleep() }
@@ -937,6 +947,10 @@ final class Renderer {
             guard setMode(MODE_CUSTOM) else { return fellAsleep() }
         }
         if drawPixel(agg) { return }
+        // Resident on the user's own CUSTOM: nothing better to show, and switching
+        // away — even to text — would hijack the mode key's cycle (CUSTOM pressed,
+        // SCROLL shown, the next press lands on OFF and INFO is never reached).
+        guard !resident else { return }
 
         switch config.display {
         case .mixed:
@@ -945,23 +959,16 @@ final class Renderer {
             surface = .text; userTexts = texts
             persist()
             guard enterText(agg) else { return fellAsleep() }
-        case .pixel where !resident:
+        case .pixel:
             release()      // don't leave the stored frame up; borrowed again once the link answers
-        default:
-            break          // resident: CUSTOM is the user's own mode, nothing better to show
+        case .text:
+            break          // unreachable: text display never draws pixels
         }
     }
 
     private func goIdle() {
         guard holding else { return }
         guard resident else { return release() }
-        if surface == .text {
-            // The busy-time fallback is over: their texts, then CUSTOM, back.
-            if let texts = userTexts { guard link.writeTexts(texts) else { return fellAsleep() } }
-            userTexts = nil; surface = .pixel; drawn = nil
-            persist()
-            guard setMode(MODE_CUSTOM) else { return fellAsleep() }
-        }
         _ = drawPixel([:])      // the dim dashboard; retried on the link's schedule if it is down
     }
 
@@ -1043,8 +1050,12 @@ final class Renderer {
     private func pixelLink() -> SerialPort? {
         if let serial, cdcUp { return serial }
         guard Date() >= nextCdcTry else { return nil }
-        if serial == nil, let path = findSerialPath() { serial = SerialPort(path: path) }
-        guard let port = serial else { cdcFailed(); return nil }
+        // A fresh descriptor for every retry: one opened while the keyboard was
+        // still coming up after a re-enumeration can stay unusable for good. On
+        // the backoff schedule this is gentle — nothing like the old six-second loop.
+        serial = nil
+        guard let path = findSerialPath(), let port = SerialPort(path: path) else { cdcFailed(); return nil }
+        serial = port
         return port
     }
 
