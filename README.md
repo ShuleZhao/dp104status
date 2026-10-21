@@ -19,10 +19,10 @@
 
 `./dp104status preview working waiting` 可以在终端里预览，不用碰硬件。
 
-也可以用单行滚动文字（`CLAUDE WORK  CODEX WAIT`），见下面的显示方式。
+借用别的模式时显示单行滚动文字（`CLAUDE WORK  CODEX WAIT`），见下面的显示方式。
 
-**它跟着你的屏幕模式走，不改你的设置**：屏幕放在 CUSTOM，它就是常驻的状态屏；
-放在 INFO 或别的模式，只在 agent 工作时借用，结束后原样还给你。
+**它跟着你的屏幕模式走，不改你的设置**：屏幕放在 CUSTOM，它就是常驻的状态屏（图标）；
+放在 INFO 或别的模式，只在 agent 工作时借用（滚动文字），结束后原样还给你。
 
 ## 状态
 
@@ -59,6 +59,7 @@ swiftc -O dp104status.swift -o dp104status
 ./dp104status hooks <claude|codex>  # 打印要安装的 hook 配置
 ./dp104status preview <a> <b>       # 终端预览图形，参数是两个 agent 的状态
 ./dp104status pixel-test            # 诊断像素链路（需先停 daemon）
+./dp104status save-dashboard        # 把暗灰仪表盘存成键盘自己的 CUSTOM 帧（屏幕先放在 CUSTOM，需先停 daemon）
 ```
 
 ### 屏幕跟随你的模式
@@ -67,8 +68,8 @@ swiftc -O dp104status.swift -o dp104status
 
 | 你把屏幕放在 | agent 工作时 | agent 全部空闲后 |
 | --- | --- | --- |
-| **CUSTOM** | 原地画状态，不切模式 | 原地画暗灰仪表盘 |
-| **其他模式**（INFO 等） | 借用：切去显示状态 | 切回你原来的模式，文字原样恢复 |
+| **CUSTOM** | 原地画状态图标，不切模式 | 原地画暗灰仪表盘 |
+| **其他模式**（INFO 等） | 借用：切到滚动文字显示状态 | 切回你原来的模式，文字原样恢复 |
 
 **借用期间你按了切换键，就是你把屏幕要回去了**：它立刻放手，直到 agent 全部
 空闲之前都不会再借。切**到** CUSTOM 则相反——那是在说"我要看状态屏"。
@@ -80,12 +81,17 @@ swiftc -O dp104status.swift -o dp104status
 ### 显示方式
 
 ```bash
-./dp104status config display mixed  # 默认：像素链路通就画图标，不通就用滚动文字
-./dp104status config display pixel  # 只用图标；链路不通时不碰你的屏幕
-./dp104status config display text   # 只用滚动文字：只走 HID，最稳
+./dp104status config display mixed  # 默认：CUSTOM 上画图标，借用别的模式时用滚动文字
+./dp104status config display pixel  # 只用图标：借用时也切进 CUSTOM 去画；链路不通时不碰你的屏幕
+./dp104status config display text   # 只用滚动文字：只走 HID，连 CUSTOM 也借成文字
 ```
 
 改完需要重启 daemon（命令会提示怎么做）。
+
+**为什么 mixed 借用时不画图标**：像素链路每一次死掉，前面都是同一个动作——屏幕刚从
+别的模式切进 CUSTOM，紧接着上传图标（详见 `DP104-PROTOCOL.md` §5.2）。所以 mixed
+从不主动切进 CUSTOM，只在你自己放在 CUSTOM 时画图标。pixel 模式借用时会切，切过去
+等 3 秒再画，能降低出事的概率，但不能保证不出事。
 
 ### 安装 hooks
 
@@ -184,9 +190,13 @@ DP104 点阵屏  (VIA CUSTOM_MENU_SET_VALUE)
 插拔只看 IOKit 的设备插拔回调；写入失败只当作"暂时没应答"，按 2→4→5 秒退避、
 期间不碰键盘，醒来后重绘一次、重开一次像素链路。
 
-**先确认能画，再切 CUSTOM。** 借用前先探测像素链路，通了才切模式；切过去之后
-上传失败就立刻切回去——固件存储的那一帧永远不会留在屏幕上。像素链路不应答时按
-15 秒起、翻倍到 5 分钟的退避重试，不会对着一条死链路反复敲。
+**拔线也不是断电。** DP104 有电池，拔掉 USB 线它照样运行，屏幕模式和文字都还在内存里。
+所以拔插前后借用照常保留、照常归还；回来时模式变了，就当作你切走了，文字还原后放手。
+
+**不主动切进 CUSTOM。** mixed 借用一律用滚动文字。只有 pixel 模式会切：先探测像素链路，
+通了才切，切过去等 3 秒再画，画不上就把屏幕还给你——固件存储的那一帧不会一直留在屏幕上。
+像素链路不应答时按 15 秒起、翻倍到 5 分钟的退避重试；每次读写最多等 1 秒，
+链路死了也卡不住 daemon。
 
 owner 键是 `{product}:{session_id}:{agent_id}`，子代理独立跟踪，
 `Stop` 会连带清掉同会话的子 owner——避免子代理结束时整块屏幕闪一下 DONE。
@@ -217,21 +227,37 @@ Claude 与 Codex 的并发 hook 通过独立的 `state.lock` 串行更新，避�
 | `keyboard not answering (asleep?)` / `keyboard awake` | 键盘休眠和醒来，正常 |
 | `you switched the screen to … — leaving it to you` | 你按了切换键，它放手了 |
 | `idle — screen handed back (INFO)` | 借用结束，屏幕还给你 |
-| `pixel link not answering — next try in …` | 像素链路暂时不通；mixed 下会先用文字 |
+| `pixel link not answering — next try in …` | 像素链路不通：CUSTOM 上的图标不更新，文字借用不受影响 |
+
+### 像素链路死了
+
+症状：屏幕放在 CUSTOM 时图标不再变化，`daemon.log` 里反复出现 `pixel link not answering`，
+`pixel-test` 显示 `ping : no answer`。打字、切换键、滚动文字都正常——只有像素通道
+（USB 串口）不通，键盘固件不再读它收到的数据。
+
+它不会自己好。要让 USB 重新连一次：
+
+1. 拔掉键盘的 USB 线，等几秒再插回去（键盘有电池，这样只是重连 USB，不会丢设置）
+2. 还不行，就重启键盘所接的扩展坞或 hub
+
+mixed 模式借用时只用文字，链路死了也照常显示状态；只有你放在 CUSTOM 时才需要它。
 
 ### 端到端测试
 
 `tests/e2e.py` 在真键盘上跑一遍借用、归还、放手、常驻、崩溃恢复、文字模式，
 每条断言都读回模式寄存器和文字槽来判定，不靠目测。会让屏幕来回切换约两分钟，
-结束时回到 INFO 和你的文字。用法见文件开头。
+结束时还原你原来的模式和文字。大部分场景不需要像素链路；`--pixel-borrow` 才会跑
+切进 CUSTOM 画图标的那个场景（可能弄死链路）。`tests/stress_borrow.py` 反复压测
+pixel 模式的借用。用法见文件开头。
 
 ## 已知限制
 
 - 只在 **USB 有线** 下验证过。2.4G / 蓝牙模式下 Raw HID 是否可用未测。
 - 屏幕文本是 ASCII，30 字符上限，会自动转大写。
 - daemon 用轮询（400ms）而不是文件监听，够用且简单。
-- 若固件里存储的 CUSTOM 帧不是仪表盘（比如早期测试留下的纯色帧），常驻模式下
-  键盘刚醒来的几秒内可能先露出它，随后被重绘覆盖。
+- 切进 CUSTOM 时键盘先显示它自己存的那一帧，daemon 等 3 秒才画上新的；像素链路不通时
+  它会一直留在屏幕上。上传的帧在主机静默一阵后会被键盘存下来，所以存的未必是仪表盘——
+  把屏幕放在 CUSTOM，停掉 daemon，跑一次 `save-dashboard` 就能把它存成暗灰仪表盘。
 
 ## 授权
 

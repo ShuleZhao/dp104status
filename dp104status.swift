@@ -75,6 +75,9 @@ let SLEEP_BACKOFF_MAX: TimeInterval = 5       //   so a redraw follows within se
 let CDC_RETRY_MIN: TimeInterval = 15          // retrying a pixel link that stopped answering:
 let CDC_RETRY_MAX: TimeInterval = 300         //   doubling, so a dead link is not hammered
 let IDLE_KEY = "(idle)"                       // cache key for the dim dashboard frame
+let CUSTOM_SETTLE: TimeInterval = 3.0         // no upload this soon after the screen enters CUSTOM
+let SERIAL_TIMEOUT: TimeInterval = 1.0        // one pixel-link packet: how long to wait to send it, and for the reply
+let STORE_QUIET: TimeInterval = 20            // save-dashboard: how long to stay silent so the keyboard stores the frame
 let EVENT_LOG_MAX_BYTES = 256 * 1024         // events.log is a debugging aid, not an archive
 
 // MARK: - Paths
@@ -98,9 +101,9 @@ func ensureStateDir() throws {
 // MARK: - Config
 
 enum Display: String, Codable {
-    case mixed     // icons while the pixel link answers, scrolling text while it doesn't
-    case pixel     // icons only — with the pixel link down, the screen is left alone
-    case text      // scrolling text only: raw HID alone, the most robust
+    case mixed     // icons on your own CUSTOM screen; scrolling text when another mode is borrowed
+    case pixel     // icons only: borrowing switches into CUSTOM; with the pixel link down, the screen is left alone
+    case text      // scrolling text only: raw HID alone, never touches the pixel link
 }
 
 /// What the screen does is otherwise decided by the user's own screen mode, not
@@ -523,11 +526,15 @@ final class SerialPort {
 
     /// macOS lets several processes hold the same /dev/cu.* at once, and they
     /// then steal each other's replies — a documented hazard for this kind of
-    /// request/response protocol. Every time this keyboard's CDC endpoint has
-    /// died, a second process had the port open moments earlier; none of the
-    /// single-process stress tests ever killed it. That is a correlation rather
-    /// than a proven cause, but one writer is correct regardless, so the port is
-    /// guarded by an advisory lock and a second opener is refused outright.
+    /// request/response protocol. It was once the suspect for the link dying;
+    /// that turned out to be something else (see letCustomSettle), but one
+    /// writer is correct regardless, so the port is guarded by an advisory lock
+    /// and a second opener is refused outright.
+    ///
+    /// All I/O is non-blocking with a deadline. When the link dies the keyboard
+    /// stops reading it altogether: the driver takes about 1.5 KB and then a
+    /// blocking write would never return — nor would a close with bytes still
+    /// queued.
     init?(path: String) {
         lockFd = open(serialLockURL.path, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
         guard lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
@@ -546,30 +553,50 @@ final class SerialPort {
         t.c_cflag |= tcflag_t(CS8) | tcflag_t(CREAD) | tcflag_t(CLOCAL)
         withUnsafeMutableBytes(of: &t.c_cc) { cc in
             cc[Int(VMIN)] = 0
-            cc[Int(VTIME)] = 10         // 1.0s read timeout
+            cc[Int(VTIME)] = 0          // reads return at once; packet() waits with poll()
         }
         guard tcsetattr(fd, TCSANOW, &t) == 0 else {
             close(f); flock(lockFd, LOCK_UN); close(lockFd); return nil
         }
-        _ = fcntl(fd, F_SETFL, 0)       // back to blocking reads
         tcflush(fd, TCIOFLUSH)
     }
 
-    deinit { close(fd); flock(lockFd, LOCK_UN); close(lockFd) }
+    deinit {
+        tcflush(fd, TCOFLUSH)           // bytes a dead link never took would hold close() up
+        close(fd); flock(lockFd, LOCK_UN); close(lockFd)
+    }
 
-    /// One fixed-size 64-byte packet: [cmd, args..., zero padding].
+    private func ready(_ events: Int32, by deadline: Date) -> Bool {
+        let left = deadline.timeIntervalSinceNow
+        guard left > 0 else { return false }
+        var p = pollfd(fd: fd, events: Int16(events), revents: 0)
+        return poll(&p, 1, Int32(left * 1000)) == 1 && p.revents & Int16(events) != 0
+    }
+
+    /// One fixed-size 64-byte packet: [cmd, args..., zero padding]. Nil if it
+    /// could not be sent, or no full reply came, within SERIAL_TIMEOUT each.
     @discardableResult
     func packet(_ cmd: UInt8, _ args: [UInt8], wantResponse: Bool = true) -> [UInt8]? {
         var buf = [UInt8](repeating: 0, count: SERIAL_BUF)
         buf[0] = cmd
         for (i, a) in args.enumerated() where i + 1 < SERIAL_BUF { buf[i + 1] = a }
-        guard write(fd, buf, buf.count) == buf.count else { return nil }
+
+        var sent = 0
+        let sendBy = Date().addingTimeInterval(SERIAL_TIMEOUT)
+        while sent < buf.count {
+            guard ready(POLLOUT, by: sendBy) else { return nil }
+            let n = buf[sent...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            if n < 0, errno != EAGAIN, errno != EINTR { return nil }
+            sent += max(n, 0)
+        }
         guard wantResponse else { return [] }
 
         var got = [UInt8]()
-        while got.count < SERIAL_BUF {
-            var chunk = [UInt8](repeating: 0, count: SERIAL_BUF - got.count)
-            let n = read(fd, &chunk, chunk.count)
+        var chunk = [UInt8](repeating: 0, count: SERIAL_BUF)
+        let replyBy = Date().addingTimeInterval(SERIAL_TIMEOUT)
+        while got.count < SERIAL_BUF, ready(POLLIN, by: replyBy) {
+            let n = read(fd, &chunk, SERIAL_BUF - got.count)
+            if n < 0, errno == EAGAIN || errno == EINTR { continue }
             if n <= 0 { break }
             got += chunk[0..<n]
         }
@@ -811,13 +838,17 @@ final class RemoteListener {
 ///   drawn. (With display text, CUSTOM is borrowed like any other mode.)
 /// - Screen on anything else: it is borrowed only while an agent is active,
 ///   and handed back — mode and texts exactly as they were — once all are idle.
+///   Borrowed as scrolling text, except with display pixel, which switches it
+///   into CUSTOM for the icons: the one move the pixel link has ever died on.
 /// - The user switching the mode while it is borrowed is them taking it back.
 ///   It is released at once and not borrowed again until the agents next go
 ///   idle. (Switching *to* CUSTOM asks for the status display instead.)
 ///
 /// The keyboard sleeps after five idle minutes and stops answering until a key
 /// wakes it. That is expected, not an unplug: the renderer backs off without
-/// touching anything, and redraws once it answers again.
+/// touching anything, and redraws once it answers again. An unplug is not a
+/// power cycle either — the keyboard runs on its battery and keeps showing
+/// whatever it showed — so a borrow outlives it and is handed back as usual.
 final class Renderer {
     private enum Surface { case pixel, text }
 
@@ -835,6 +866,7 @@ final class Renderer {
     private var cdcUp = false
     private var cdcBackoff = CDC_RETRY_MIN
     private var nextCdcTry = Date.distantPast
+    private var uploadsAfter = Date.distantPast   // held back while CUSTOM settles
 
     // Ownership of the screen
     private var surface: Surface?            // nil: the screen is the user's
@@ -848,7 +880,9 @@ final class Renderer {
     private var recovered = false
 
     private var holding: Bool { surface != nil }
-    private var resident: Bool { holding && userMode == MODE_CUSTOM }
+    /// Drawing icons into the user's own CUSTOM. Text display borrows CUSTOM like
+    /// any other mode, and that borrow is handed back like any other.
+    private var resident: Bool { surface == .pixel && userMode == MODE_CUSTOM }
 
     init(link: HIDLink) { self.link = link }
 
@@ -876,8 +910,10 @@ final class Renderer {
             if holding, let expected = onScreen, mode != expected {
                 return userSwitched(to: mode, active: active)
             }
+            let previous = onScreen
             onScreen = mode
             if !holding, mode == MODE_CUSTOM, config.display != .text {
+                if previous != MODE_CUSTOM { letCustomSettle() }   // just switched there (or just started)
                 // The user's own mode is CUSTOM: that is the status display. This is
                 // also how a fresh start, or a switch to CUSTOM, picks it up — and
                 // switching there is asking for it, so it undoes a dismissal.
@@ -917,19 +953,18 @@ final class Renderer {
             _ = drawPixel(agg)
             return
         }
-        if config.display != .text, pixelLinkAnswers() {
+        if config.display == .pixel {
+            // Icons on a borrowed screen mean switching it into CUSTOM, and an
+            // upload soon after that switch is the one thing the pixel link has
+            // ever died on. Pixel-only asks for it; mixed borrows with text instead.
+            guard pixelLinkAnswers() else {
+                return note("pixel link down and display is pixel-only — leaving the screen alone")
+            }
             surface = .pixel
             persist()                                    // on disk before the screen is touched
             guard setMode(MODE_CUSTOM) else { return fellAsleep() }
-            if drawPixel(agg) { return }
-            // The link died between the check and the frame. Never leave the
-            // screen on CUSTOM showing the firmware's stored frame.
-            guard setMode(mode) else { return fellAsleep() }
-            surface = nil
-            persist()
-        }
-        guard config.display != .pixel else {
-            return note("pixel link down and display is pixel-only — leaving the screen alone")
+            _ = drawPixel(agg)      // waits for CUSTOM to settle; refresh() hands back if the link fails
+            return
         }
         guard let texts = link.readTexts() else { return fellAsleep() }
         surface = .text; userTexts = texts
@@ -939,11 +974,14 @@ final class Renderer {
 
     private func refresh(_ agg: [String: Activity]) {
         if surface == .text {
-            guard config.display == .mixed, pixelLinkAnswers() else { return drawText(agg) }
-            // Mixed and the pixel link answers again: their texts back, then CUSTOM.
-            if let texts = userTexts { guard link.writeTexts(texts) else { return fellAsleep() } }
-            userTexts = nil; surface = .pixel; drawn = nil
-            persist()
+            // Back on SCROLL first if a write went missing on the way in.
+            guard onScreen == MODE_SCROLL else {
+                guard enterText(agg) else { return fellAsleep() }
+                return
+            }
+            return drawText(agg)
+        }
+        if !resident, onScreen != MODE_CUSTOM {
             guard setMode(MODE_CUSTOM) else { return fellAsleep() }
         }
         if drawPixel(agg) { return }
@@ -951,32 +989,22 @@ final class Renderer {
         // away — even to text — would hijack the mode key's cycle (CUSTOM pressed,
         // SCROLL shown, the next press lands on OFF and INFO is never reached).
         guard !resident else { return }
-
-        switch config.display {
-        case .mixed:
-            log("pixel link down — showing text until it answers again")
-            guard let texts = link.readTexts() else { return fellAsleep() }
-            surface = .text; userTexts = texts
-            persist()
-            guard enterText(agg) else { return fellAsleep() }
-        case .pixel:
-            release()      // don't leave the stored frame up; borrowed again once the link answers
-        case .text:
-            break          // unreachable: text display never draws pixels
-        }
+        // A pixel-only borrow: don't leave the stored frame up. Borrowed again
+        // once the link answers.
+        release(because: "pixel link down")
     }
 
     private func goIdle() {
         guard holding else { return }
-        guard resident else { return release() }
+        guard resident else { return release(because: "idle") }
         _ = drawPixel([:])      // the dim dashboard; retried on the link's schedule if it is down
     }
 
-    private func release() {
+    private func release(because reason: String) {
         guard handBack(Takeover(userMode: userMode, userTexts: userTexts), via: link) else {
             return fellAsleep()      // stays held; tried again once the keyboard answers
         }
-        log("idle — screen handed back (\(modeName(userMode)))")
+        log("\(reason) — screen handed back (\(modeName(userMode)))")
         surface = nil; userTexts = nil; onScreen = userMode; drawn = nil
         persist()
     }
@@ -986,16 +1014,19 @@ final class Renderer {
         log("you switched the screen to \(modeName(mode)) — leaving it to you")
         surface = nil; userTexts = nil; onScreen = mode; drawn = nil
         persist()
+        if mode == MODE_CUSTOM { letCustomSettle() }
         // Switching *to* CUSTOM asks for the status display; anything else is a dismissal.
         dismissed = active && !(mode == MODE_CUSTOM && config.display != .text)
     }
 
     // MARK: Drawing
 
+    /// False only when the pixel link failed. While CUSTOM settles nothing is
+    /// sent and it reports success: the frame goes out on a later tick.
     private func drawPixel(_ agg: [String: Activity]) -> Bool {
         let text = render(agg)
         let key = "pixel:" + (text.isEmpty ? IDLE_KEY : text)
-        if drawn == key { return true }
+        if drawn == key || Date() < uploadsAfter { return true }
         guard let port = pixelLink() else { return false }
         guard port.sendFrame(buildFrame(agg), rows: SCREEN_ROWS, cols: SCREEN_COLS) else {
             cdcFailed(); return false
@@ -1030,8 +1061,19 @@ final class Renderer {
         if onScreen == m { return true }
         guard link.setScreenMode(m) else { return false }
         onScreen = m
+        if m == MODE_CUSTOM { letCustomSettle() }
         return true
     }
+
+    /// Entering CUSTOM makes the firmware reload its stored frame. Each of the
+    /// four pixel-link deaths the logs show the lead-up to came on an upload
+    /// within a second or two of the screen changing into CUSTOM; uploading
+    /// into a CUSTOM that had been up a while has never failed. The link then
+    /// stays dead — the keyboard stops reading it — until USB re-enumerates.
+    /// Holding uploads back one second gave 34 clean switches in a row and then
+    /// a failure, so the wait is longer now; mixed display avoids the question
+    /// by never making that switch itself.
+    private func letCustomSettle() { uploadsAfter = Date().addingTimeInterval(CUSTOM_SETTLE) }
 
     private func persist() {
         if holding, userMode != MODE_CUSTOM || userTexts != nil {
@@ -1090,13 +1132,17 @@ final class Renderer {
         seenGeneration = gen
         if link.device != nil { log("keyboard connected") }
         else { log(first ? "waiting for the keyboard" : "keyboard unplugged") }
-        // An unplug is a power cycle: the keyboard comes back on its own saved
-        // settings, so anything borrowed is already undone. (The very first
-        // sighting is not one — a takeover on disk then still needs handing back.)
-        if !first { surface = nil; userTexts = nil; Takeover.clear() }
-        onScreen = nil; drawn = nil; dismissed = false; lastCheck = .distantPast
+        // An unplug is not a power cycle: the keyboard runs on its battery and
+        // keeps its mode and texts, so a borrowed screen is still borrowed when it
+        // comes back and is handed back as usual. The mode it was left in is kept
+        // as well — finding a different one on return is the user's doing (or a
+        // real power cycle to their saved mode), and releases the borrow with
+        // their texts restored, like any other switch. Treating the unplug as a
+        // reset is what once left status text in the user's slots for good.
+        drawn = nil; lastCheck = .distantPast
         serial = nil; cdcUp = false; cdcBackoff = CDC_RETRY_MIN; nextCdcTry = .distantPast
         asleep = false; sleepBackoff = SLEEP_BACKOFF_MIN
+        if onScreen == MODE_CUSTOM { letCustomSettle() }   // coming back may reload the stored frame
     }
 
     private func awake() -> Bool {
@@ -1115,6 +1161,7 @@ final class Renderer {
         // does not change it, so a different mode now is the user's doing.
         drawn = nil
         serial = nil; cdcUp = false; cdcBackoff = CDC_RETRY_MIN; nextCdcTry = .distantPast
+        if onScreen == MODE_CUSTOM { letCustomSettle() }   // waking may reload the stored frame too
         return true
     }
 
@@ -1237,6 +1284,53 @@ case "probe":
     print("pixel link  : " + (findSerialPath() ?? "no serial node"))
     if let t = Takeover.load() { print("borrowed    : goes back to \(modeName(t.userMode))") }
 
+case "save-dashboard":
+    // Make the idle dashboard the keyboard's own stored CUSTOM frame. The
+    // keyboard shows that frame whenever CUSTOM is entered and nothing has been
+    // drawn yet — the pixel link down, a moment after waking — so it should say
+    // "nothing running", not whatever happened to be stored before.
+    //
+    // The keyboard keeps an uploaded frame once the host has gone quiet for a
+    // while; a daemon polling the mode every few seconds never lets it, which is
+    // why a test frame could outlive hundreds of later uploads. So: upload once,
+    // then say nothing.
+    //
+    // It never switches into CUSTOM itself — an upload soon after that switch
+    // is the one thing the pixel link has died on — so the screen must already
+    // be there.
+    let link = HIDLink()
+    guard link.device != nil else { print("no keyboard on USB"); exit(1) }
+    guard let mode = link.screenMode() else {
+        print("keyboard did not answer — asleep? press a key and try again"); exit(1)
+    }
+    guard mode == MODE_CUSTOM else {
+        print("the screen is on \(modeName(mode)). Switch it to CUSTOM with the mode key, then run")
+        print("this again — it does not switch there itself, because an upload soon after")
+        print("entering CUSTOM is what has killed the pixel link every time.")
+        exit(1)
+    }
+    guard let path = findSerialPath() else { print("no pixel link node for the keyboard"); exit(1) }
+    guard let port = SerialPort(path: path) else {
+        print("the daemon holds the pixel link — stop it first:")
+        print("  launchctl bootout gui/$(id -u)/com.skyler.dp104status")
+        exit(1)
+    }
+    Thread.sleep(forTimeInterval: CUSTOM_SETTLE)   // in case you only just switched there
+    guard port.sendFrame(buildFrame([:]), rows: SCREEN_ROWS, cols: SCREEN_COLS) else {
+        print("the pixel link is not answering — nothing was changed. Unplug the keyboard's")
+        print("cable for a few seconds and plug it back in; if it still does not answer,")
+        print("restart the hub or dock it is plugged into.")
+        exit(1)
+    }
+    print("dashboard uploaded — staying silent \(Int(STORE_QUIET))s so the keyboard keeps it…")
+    Thread.sleep(forTimeInterval: STORE_QUIET)
+    // Leaving CUSTOM and coming back makes the keyboard reload what it stored,
+    // so the screen afterwards shows what it actually kept. No upload follows.
+    _ = link.setScreenMode(MODE_INFO)
+    Thread.sleep(forTimeInterval: 1)
+    _ = link.setScreenMode(MODE_CUSTOM)
+    print("done — the screen now shows the stored frame: it should be the dim dashboard")
+
 case "restore":
     // Hand back a borrowed screen by hand. With the daemon running it will
     // borrow again while agents are active — stop it first to keep it back.
@@ -1272,8 +1366,9 @@ case "pixel-test":
     } else {
         print("header resp : <nil — no 64-byte reply>"); exit(1)
     }
-    let demo: [String: Activity] = ["claude": .working, "codex": .waiting]
-    let ok = port.sendFrame(buildFrame(demo), rows: SCREEN_ROWS, cols: SCREEN_COLS)
+    // The dim dashboard, not a demo of states: whatever goes up here may become
+    // the keyboard's stored frame if nothing follows it for a while.
+    let ok = port.sendFrame(buildFrame([:]), rows: SCREEN_ROWS, cols: SCREEN_COLS)
     print("sendFrame   : \(ok ? "OK" : "FAILED")")
 
 case "preview":
@@ -1369,6 +1464,7 @@ default:
       dp104status status                  what the daemon would render, and what it holds
       dp104status probe                   read-only look at the keyboard
       dp104status restore                 hand a borrowed screen back by hand
+      dp104status save-dashboard          store the dim dashboard as the keyboard's CUSTOM frame (screen on CUSTOM)
       dp104status config [display <mixed|pixel|text>] [remote <port|off>]
       dp104status hooks <claude|codex>    print hook config to install
       dp104status remote-hook <product>   print the forwarder for an SSH host
